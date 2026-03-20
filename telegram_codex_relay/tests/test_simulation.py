@@ -1,10 +1,14 @@
 import json
 import tempfile
 import unittest
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
 
 from telegram_codex_relay.telegram_bot import BotConfig, DirectTelegramCodexBot, RunningPrompt
+
+BRIDGE_PATH = Path(__file__).resolve().parents[1] / "bin" / "codex-bridge"
+bridge = SourceFileLoader("codex_bridge_for_tests", str(BRIDGE_PATH)).load_module()
 
 
 class FakeApi:
@@ -70,8 +74,22 @@ class SimulatedBot(DirectTelegramCodexBot):
         if args[:1] == ["sessions-json"]:
             return json.dumps(
                 [
-                    {"id": "sess-active", "name": "Primary Session", "cwd": str(Path(self.config.workdir) / "project-a"), "updatedAt": 111, "active": True},
-                    {"id": "sess-2", "name": "Second Session", "cwd": str(Path(self.config.workdir) / "project-b"), "updatedAt": 110, "active": False},
+                    {
+                        "id": "sess-active",
+                        "name": "Primary Session",
+                        "cwd": str(Path(self.config.workdir) / "project-a"),
+                        "createdAt": 101,
+                        "updatedAt": 111,
+                        "active": True,
+                    },
+                    {
+                        "id": "sess-2",
+                        "name": "Second Session",
+                        "cwd": str(Path(self.config.workdir) / "project-b"),
+                        "createdAt": 100,
+                        "updatedAt": 110,
+                        "active": False,
+                    },
                 ],
                 ensure_ascii=False,
             )
@@ -143,11 +161,14 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertIn("Codex 텔레그램 사용법", sent["text"])
         self.assertEqual(sent["reply_to_message_id"], 10)
         self.assertEqual(sent["inline_keyboard"][0][0]["text"], "세션")
+        self.assertEqual(sent["inline_keyboard"][1][0]["text"], "Fast")
 
     def test_resume_menu_includes_create_and_delete_buttons(self):
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 11, "text": "/resume"})
         sent = self.bot.api.sent[-1]
         self.assertIn("Codex 세션", sent["text"])
+        self.assertIn("created:", sent["text"])
+        self.assertIn(str(Path(self.bot.config.workdir) / "project-a"), sent["text"])
         self.assertEqual(sent["inline_keyboard"][0][0]["text"], "새 세션 만들기")
         self.assertEqual(sent["inline_keyboard"][0][1]["text"], "현재 세션 삭제")
 
@@ -222,6 +243,35 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertEqual(self.bot.bridge_calls[0]["args"], ["new-session", str(browser_root)])
         self.assertIn("Codex 새 세션을 만들었습니다.", self.bot.api.sent[0]["text"])
 
+    def test_session_browser_lists_full_visible_paths(self):
+        browser_root = self.tmpdir / "browser-root"
+        long_name = "a-very-long-directory-name-for-browser-check"
+        (browser_root / long_name).mkdir(parents=True)
+        self.bot.write_runtime_state(session_browser_path=str(browser_root), session_browser_page=0, session_browser_token="token-1")
+        text, buttons = self.bot.build_session_browser_menu()
+        self.assertIn(str(browser_root / long_name), text)
+        labels = [button["text"] for row in buttons for button in row]
+        self.assertIn("../", labels)
+        self.assertIn("현재 폴더로 세션 시작", labels)
+        self.assertIn("새 폴더 만들기", labels)
+
+    def test_new_folder_message_creates_directory_and_session(self):
+        parent = self.tmpdir / "parent"
+        parent.mkdir()
+        self.bot.set_pending_new_folder_parent(parent)
+        self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 82, "text": "fresh-folder"})
+        self.assertTrue((parent / "fresh-folder").is_dir())
+        self.assertEqual(self.bot.bridge_calls[0]["args"], ["new-session", str(parent / "fresh-folder")])
+        self.assertIsNone(self.bot.pending_new_folder_parent())
+
+    def test_cancel_clears_pending_new_folder_input(self):
+        parent = self.tmpdir / "parent"
+        parent.mkdir()
+        self.bot.set_pending_new_folder_parent(parent)
+        self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 83, "text": "/cancel"})
+        self.assertIsNone(self.bot.pending_new_folder_parent())
+        self.assertIn("새 폴더 생성 입력을 취소했습니다.", self.bot.api.sent[0]["text"])
+
     def test_session_delete_deletes_current_active_session(self):
         self.bot.handle_callback(
             {
@@ -266,6 +316,49 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertEqual(process.received_input, "reply with ok\n")
         self.assertIn("DIRECT_PROMPT_OK", self.bot.api.sent[-1]["text"])
         write_runtime_state.assert_called()
+
+
+class CodexBridgeUnitTests(unittest.TestCase):
+    def make_thread(self, thread_id: str, title: str) -> bridge.ThreadEntry:
+        return bridge.ThreadEntry(
+            id=thread_id,
+            title=title,
+            cwd=f"/tmp/{thread_id}",
+            created_at=100,
+            updated_at=110,
+            rollout_path=f"/tmp/{thread_id}.jsonl",
+            sandbox_policy="danger-full-access",
+            approval_mode="never",
+            model_provider="openai",
+            cli_version="0.0.0",
+        )
+
+    def test_cmd_read_prefers_active_session_over_last_execution(self):
+        state = {
+            "active_session_id": "active",
+            "last_execution_session_id": "older",
+            "last_execution_session_name": "Older Session",
+        }
+
+        def fake_get_thread(thread_id):
+            if thread_id == "active":
+                return self.make_thread("active", "Active Session")
+            if thread_id == "older":
+                return self.make_thread("older", "Older Session")
+            return None
+
+        def fake_thread_output_messages(thread, limit=5):
+            if thread.id == "active":
+                return ["active output"]
+            return ["older output"]
+
+        with patch.object(bridge, "get_thread", side_effect=fake_get_thread), patch.object(
+            bridge, "thread_output_messages", side_effect=fake_thread_output_messages
+        ):
+            output = bridge.cmd_read(state, None)
+
+        self.assertIn("Active Session", output)
+        self.assertIn("active output", output)
 
 
 if __name__ == "__main__":

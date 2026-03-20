@@ -14,6 +14,7 @@
 - 버튼 메뉴:
   - `세션`
   - `모델`
+  - `Fast`
   - `Thinking`
   - `권한`
   - `최근 출력`
@@ -24,8 +25,16 @@
   - 최근 세션 선택
   - `새 세션 만들기`
   - `현재 세션 삭제`
-- 새 세션 만들기는 `~/`부터 폴더 브라우저를 열고, 폴더 버튼으로 내려가서 `이 폴더로 세션 생성`으로 완료
+- 세션 목록은 최신 활동 순으로 정렬
+- 세션 목록은 각 세션의 전체 `cwd`, 생성 시각, 수정 시각을 표시
+- 새 세션 만들기는 `~/`부터 폴더 브라우저를 열고, 현재 폴더의 바로 아래 하위 폴더만 보여줌
+- 세션 브라우저에서:
+  - 폴더 버튼으로 안쪽으로 이동
+  - `../` 버튼으로 상위 폴더 이동
+  - `현재 폴더로 세션 시작`
+  - `새 폴더 만들기`를 누른 뒤 다음 일반 메시지로 폴더 이름을 보내 새 폴더 생성 후 세션 시작
 - 현재 세션 삭제는 active 세션만 archive 처리
+- `/read`와 `최근 출력`은 현재 active 세션을 우선 기준으로 읽음
 - `/status`는 아래 값을 보여줌
   - active session id/name/cwd
   - permission
@@ -69,6 +78,7 @@
 - 단위/시뮬레이션 테스트 통과
 - `python3 -m py_compile` 통과
 - 실제 `Codex bridge`로 새 세션 생성 확인
+- 실제 `Codex bridge`로 `resume -> read` 즉시 확인
 - 실제 `Codex bridge`로 최소 프롬프트 실행 확인
 - 실제 `Codex bridge`로 현재 세션 archive 삭제 확인
 - `scripts/get_chat_id.py` 실행 확인
@@ -78,8 +88,9 @@
 
 2026-03-20 로컬 검증 기준:
 
-- `scripts/run_tests.sh` 통과
+- `scripts/run_tests.sh` 17개 통과
 - 새 레포 경로의 `codex-bridge`로 `new-session -> prompt -> delete-session` 실검증 완료
+- 새 레포 경로의 `codex-bridge`로 `resume -> read -> restore` 실검증 완료
 - 기존 사용자 서비스 `telegram-codex-relay.service`는 중지했고, 현재는 `codex-telegram-bridge.service`가 새 레포 경로를 사용 중
 
 ## 비용과 외부 의존성

@@ -57,6 +57,7 @@ class ThreadEntry:
     id: str
     title: str
     cwd: str
+    created_at: int
     updated_at: int
     rollout_path: str
     sandbox_policy: str
@@ -150,7 +151,7 @@ def open_state_db() -> sqlite3.Connection:
 
 def list_threads(limit: int = 20, cwd_filter: str | None = None) -> list[ThreadEntry]:
     query = """
-        select id, title, cwd, updated_at, rollout_path, sandbox_policy, approval_mode, model_provider, cli_version
+        select id, title, cwd, created_at, updated_at, rollout_path, sandbox_policy, approval_mode, model_provider, cli_version
         from threads
         where archived = 0
     """
@@ -158,7 +159,7 @@ def list_threads(limit: int = 20, cwd_filter: str | None = None) -> list[ThreadE
     if cwd_filter:
         query += " and cwd = ?"
         params.append(cwd_filter)
-    query += " order by updated_at desc limit ?"
+    query += " order by updated_at desc, created_at desc limit ?"
     params.append(max(limit, 1))
     with open_state_db() as conn:
         rows = conn.execute(query, tuple(params)).fetchall()
@@ -167,6 +168,7 @@ def list_threads(limit: int = 20, cwd_filter: str | None = None) -> list[ThreadE
             id=str(row["id"]),
             title=str(row["title"]),
             cwd=str(row["cwd"]),
+            created_at=int(row["created_at"]),
             updated_at=int(row["updated_at"]),
             rollout_path=str(row["rollout_path"]),
             sandbox_policy=str(row["sandbox_policy"]),
@@ -180,7 +182,7 @@ def list_threads(limit: int = 20, cwd_filter: str | None = None) -> list[ThreadE
 
 def get_thread(thread_id: str) -> ThreadEntry | None:
     query = """
-        select id, title, cwd, updated_at, rollout_path, sandbox_policy, approval_mode, model_provider, cli_version
+        select id, title, cwd, created_at, updated_at, rollout_path, sandbox_policy, approval_mode, model_provider, cli_version
         from threads
         where id = ?
     """
@@ -192,6 +194,7 @@ def get_thread(thread_id: str) -> ThreadEntry | None:
         id=str(row["id"]),
         title=str(row["title"]),
         cwd=str(row["cwd"]),
+        created_at=int(row["created_at"]),
         updated_at=int(row["updated_at"]),
         rollout_path=str(row["rollout_path"]),
         sandbox_policy=str(row["sandbox_policy"]),
@@ -528,7 +531,13 @@ def format_sessions(threads: list[ThreadEntry], limit: int = 8) -> str:
 
 def store_last_list(state: dict[str, Any], threads: list[ThreadEntry]) -> None:
     state["last_list"] = [
-        {"id": entry.id, "name": entry.title, "updatedAt": entry.updated_at}
+        {
+            "id": entry.id,
+            "name": entry.title,
+            "cwd": entry.cwd,
+            "createdAt": entry.created_at,
+            "updatedAt": entry.updated_at,
+        }
         for entry in threads[:20]
     ]
     save_state(state)
@@ -586,6 +595,7 @@ def cmd_sessions_json(state: dict[str, Any], limit_arg: str | None) -> str:
             "id": entry.id,
             "name": entry.title,
             "cwd": entry.cwd,
+            "createdAt": entry.created_at,
             "updatedAt": entry.updated_at,
             "active": entry.id == active_id,
         }
@@ -672,24 +682,33 @@ def cmd_read(state: dict[str, Any], tail_arg: str | None) -> str:
         tail = int(tail_arg) if tail_arg else 5
     except ValueError:
         tail = 5
-    target_id = str(state.get("last_execution_session_id") or state.get("active_session_id") or "").strip()
-    if not target_id:
+    candidate_ids: list[str] = []
+    for value in [state.get("active_session_id"), state.get("last_execution_session_id")]:
+        target_id = str(value or "").strip()
+        if target_id and target_id not in candidate_ids:
+            candidate_ids.append(target_id)
+    if not candidate_ids:
         return "현재 활성 Codex 세션이 없습니다."
-    thread = get_thread(target_id)
-    if not thread:
+    missing_ids: list[str] = []
+    for target_id in candidate_ids:
+        thread = get_thread(target_id)
+        if not thread:
+            missing_ids.append(target_id)
+            continue
+        messages = thread_output_messages(thread, limit=max(tail, 1))
+        if not messages:
+            continue
+        lines = [f"최근 Codex 출력 ({thread.title}):"]
+        for index, message in enumerate(messages, start=1):
+            lines.append("")
+            lines.append(f"[{index}]")
+            lines.append(message)
+        return "\n".join(lines)
+    if missing_ids:
         state["last_execution_session_id"] = None
         state["last_execution_session_name"] = None
         save_state(state)
-        return "현재 활성 Codex 세션을 찾지 못했습니다."
-    messages = thread_output_messages(thread, limit=max(tail, 1))
-    if not messages:
-        return "읽을 수 있는 Codex 출력이 없습니다."
-    lines = [f"최근 Codex 출력 ({thread.title}):"]
-    for index, message in enumerate(messages, start=1):
-        lines.append("")
-        lines.append(f"[{index}]")
-        lines.append(message)
-    return "\n".join(lines)
+    return "읽을 수 있는 Codex 출력이 없습니다."
 
 
 def cmd_status(state: dict[str, Any]) -> str:
@@ -703,6 +722,8 @@ def cmd_status(state: dict[str, Any]) -> str:
         f"- activeSessionId: {active_id or '-'}",
         f"- activeSessionName: {state.get('active_session_name') or '-'}",
         f"- activeSessionCwd: {active_thread.cwd if active_thread else state.get('workdir') or '-'}",
+        f"- activeSessionCreatedAt: {active_thread.created_at if active_thread else '-'}",
+        f"- activeSessionUpdatedAt: {active_thread.updated_at if active_thread else '-'}",
         f"- lastExecutionSessionId: {execution_id or '-'}",
         f"- lastExecutionSessionName: {state.get('last_execution_session_name') or '-'}",
         f"- permission: {permission_mode(state.get('permission'))}",

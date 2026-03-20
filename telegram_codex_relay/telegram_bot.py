@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -159,6 +160,16 @@ def format_path_label(path_value: str | Path) -> str:
         return str(path)
 
 
+def format_timestamp(epoch_value: Any) -> str:
+    try:
+        epoch = int(epoch_value or 0)
+    except Exception:
+        return "-"
+    if epoch <= 0:
+        return "-"
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+
+
 def parse_button_action(value: str) -> tuple[str, str | None] | None:
     text = value.strip()
     if not text.startswith(BUTTON_PREFIX):
@@ -283,6 +294,23 @@ class DirectTelegramCodexBot:
         token = str(data.get("session_browser_token") or "")
         return path, page, token
 
+    def pending_new_folder_parent(self) -> Path | None:
+        data = self.load_runtime_state()
+        raw = str(data.get("pending_new_folder_parent") or "").strip()
+        if not raw:
+            return None
+        try:
+            path = Path(raw).expanduser().resolve()
+        except Exception:
+            return None
+        return path
+
+    def set_pending_new_folder_parent(self, path: Path | None) -> None:
+        if path is None:
+            self.write_runtime_state(pending_new_folder_parent=None)
+            return
+        self.write_runtime_state(pending_new_folder_parent=str(path.expanduser().resolve()))
+
     def set_session_browser_state(self, path: Path, page: int = 0) -> str:
         normalized = path.expanduser().resolve()
         token = str(int(time.time() * 1000))
@@ -300,10 +328,24 @@ class DirectTelegramCodexBot:
             return []
         return sorted(entries, key=lambda entry: (entry.name.startswith("."), entry.name.lower()))
 
-    def session_button_label(self, entry: dict[str, Any], active: bool) -> str:
-        cwd = format_path_label(str(entry.get("cwd") or ""))
-        label = truncate_button_label(cwd, max_chars=26)
-        return label_with_check(active, label)
+    def session_button_label(self, index: int, entry: dict[str, Any], active: bool) -> str:
+        cwd_name = Path(str(entry.get("cwd") or "")).name or str(entry.get("id") or index)
+        label = f"{index}. {cwd_name}"
+        return label_with_check(active, truncate_button_label(label, max_chars=30))
+
+    def browser_button_label(self, index: int, entry: Path) -> str:
+        label = f"{index}. {entry.name or str(entry)}"
+        return truncate_button_label(label, max_chars=30)
+
+    def format_session_entry_lines(self, index: int, entry: dict[str, Any], active: bool) -> list[str]:
+        status = "현재 선택됨" if active else "선택 가능"
+        return [
+            f"[{index}] {entry.get('name') or entry.get('id') or '-'}",
+            f"  cwd: {entry.get('cwd') or '-'}",
+            f"  created: {format_timestamp(entry.get('createdAt'))}",
+            f"  updated: {format_timestamp(entry.get('updatedAt'))}",
+            f"  status: {status}",
+        ]
 
     def current_runtime_status(self) -> tuple[str, RunningPrompt | None]:
         with self.running_lock:
@@ -350,30 +392,34 @@ class DirectTelegramCodexBot:
                 {"text": "모델", "callback_data": button_data("menu", "model")},
             ],
             [
+                {"text": "Fast", "callback_data": button_data("thinking", "fast")},
                 {"text": "Thinking", "callback_data": button_data("menu", "thinking")},
-                {"text": "권한", "callback_data": button_data("menu", "permission")},
             ],
             [
+                {"text": "권한", "callback_data": button_data("menu", "permission")},
                 {"text": "최근 출력", "callback_data": button_data("read")},
-                {"text": "현재 상태", "callback_data": button_data("status")},
             ],
-            [{"text": "취소", "callback_data": button_data("cancel")}],
+            [
+                {"text": "현재 상태", "callback_data": button_data("status")},
+                {"text": "취소", "callback_data": button_data("cancel")},
+            ],
         ]
         return text, buttons
 
     def build_resume_menu(self) -> tuple[str, list[list[dict[str, str]]]]:
         state = self.load_bridge_state()
-        raw = self.run_bridge(["sessions-json", "8"])
+        raw = self.run_bridge(["sessions-json", "12"])
         entries = json.loads(raw)
         rows: list[list[dict[str, str]]] = []
         active_id = str(state.get("active_session_id") or "").strip()
-        current_cwd = format_path_label(str(state.get("workdir") or ""))
+        current_cwd = str(state.get("workdir") or "-")
         text_lines = [
             "Codex 세션",
             f"현재 세션: {format_state_value(state.get('active_session_name'), '(none)')}",
             f"현재 작업 폴더: {current_cwd}",
             "",
-            "최근 세션:",
+            "최근 세션 순서: 최신 활동 순",
+            "",
         ]
         rows.append(
             [
@@ -383,15 +429,14 @@ class DirectTelegramCodexBot:
         )
         if not entries:
             text_lines.append("- 사용 가능한 세션이 없습니다.")
-        for entry in entries:
+        for index, entry in enumerate(entries, start=1):
             active = bool(entry.get("active")) or str(entry.get("id") or "") == active_id
-            cwd_label = format_path_label(str(entry.get("cwd") or ""))
-            title = str(entry.get("name") or entry.get("id") or "").strip()
-            text_lines.append(f"- {cwd_label} | {truncate_button_label(title, max_chars=60)}")
+            text_lines.extend(self.format_session_entry_lines(index, entry, active))
+            text_lines.append("")
             rows.append(
                 [
                     {
-                        "text": self.session_button_label(entry, active),
+                        "text": self.session_button_label(index, entry, active),
                         "callback_data": button_data("resume", str(entry.get("id"))),
                     }
                 ]
@@ -406,6 +451,7 @@ class DirectTelegramCodexBot:
 
     def build_session_browser_menu(self) -> tuple[str, list[list[dict[str, str]]]]:
         path, page, _ = self.session_browser_state()
+        pending_parent = self.pending_new_folder_parent()
         directories = self.list_browser_directories(path)
         page_count = max((len(directories) - 1) // SESSION_BROWSER_PAGE_SIZE + 1, 1)
         page = min(page, page_count - 1)
@@ -414,18 +460,31 @@ class DirectTelegramCodexBot:
         visible = directories[start : start + SESSION_BROWSER_PAGE_SIZE]
         text_lines = [
             "새 Codex 세션 만들기",
-            f"현재 폴더: {format_path_label(path)}",
+            f"현재 폴더: {path}",
             f"페이지: {page + 1}/{page_count}",
             "",
-            "폴더를 눌러 안으로 들어가고, 원하는 위치에서 생성 버튼을 누르세요.",
+            "현재 폴더의 바로 아래 하위 폴더만 보여줍니다.",
+            "폴더 버튼을 눌러 안으로 들어가거나, ../ 버튼으로 다시 나올 수 있습니다.",
         ]
+        if pending_parent is not None:
+            text_lines.extend(
+                [
+                    "",
+                    f"새 폴더 이름 입력 대기 중: {pending_parent}",
+                    "이름을 일반 메시지로 보내거나 /cancel 을 누르세요.",
+                ]
+            )
         rows: list[list[dict[str, str]]] = []
-        for index, entry in enumerate(visible):
+        if visible:
+            text_lines.append("")
+            text_lines.append("보이는 폴더:")
+        for index, entry in enumerate(visible, start=1):
+            text_lines.append(f"[{index}] {entry}")
             rows.append(
                 [
                     {
-                        "text": truncate_button_label(entry.name or str(entry), max_chars=28),
-                        "callback_data": button_data("sessbrowse", f"open|{token}|{index}"),
+                        "text": self.browser_button_label(index, entry),
+                        "callback_data": button_data("sessbrowse", f"open|{token}|{index - 1}"),
                     }
                 ]
             )
@@ -434,7 +493,7 @@ class DirectTelegramCodexBot:
             text_lines.append("- 하위 폴더가 없습니다.")
         nav_row: list[dict[str, str]] = []
         if path.parent != path:
-            nav_row.append({"text": "상위", "callback_data": button_data("sessbrowse", f"up|{token}")})
+            nav_row.append({"text": "../", "callback_data": button_data("sessbrowse", f"up|{token}")})
         if page > 0:
             nav_row.append({"text": "이전", "callback_data": button_data("sessbrowse", f"page|{token}|{page - 1}")})
         if page + 1 < page_count:
@@ -443,13 +502,18 @@ class DirectTelegramCodexBot:
             rows.append(nav_row)
         rows.append(
             [
-                {"text": "이 폴더로 세션 생성", "callback_data": button_data("sessbrowse", f"create|{token}")},
-                {"text": "세션 메뉴", "callback_data": button_data("menu", "resume")},
+                {"text": "현재 폴더로 세션 시작", "callback_data": button_data("sessbrowse", f"create|{token}")},
+                {"text": "새 폴더 만들기", "callback_data": button_data("sessbrowse", f"mkdir|{token}")},
             ]
         )
         rows.append(
             [
+                {"text": "세션 메뉴", "callback_data": button_data("menu", "resume")},
                 {"text": "도움말", "callback_data": button_data("menu", "help")},
+            ]
+        )
+        rows.append(
+            [
                 {"text": "현재 상태", "callback_data": button_data("status")},
             ]
         )
@@ -564,6 +628,25 @@ class DirectTelegramCodexBot:
             f"- preview: {running.prompt_preview}\n"
             "- 필요하면 /cancel 후 다시 시도하세요."
         )
+
+    def create_new_folder_session(self, folder_name: str) -> str:
+        parent = self.pending_new_folder_parent()
+        if parent is None:
+            raise RuntimeError("새 폴더 생성 대기 상태가 아닙니다.")
+        raw_name = folder_name.strip()
+        if not raw_name:
+            raise RuntimeError("새 폴더 이름이 비어 있습니다.")
+        if raw_name in {".", ".."}:
+            raise RuntimeError("`.` 또는 `..` 는 폴더 이름으로 사용할 수 없습니다.")
+        if "/" in raw_name or "\\" in raw_name:
+            raise RuntimeError("새 폴더 이름에는 경로 구분자를 넣을 수 없습니다.")
+        target = parent / raw_name
+        if target.exists():
+            raise RuntimeError(f"이미 같은 이름의 경로가 있습니다: {target}")
+        target.mkdir(parents=False, exist_ok=False)
+        output = self.run_bridge(["new-session", str(target)], timeout_ms=120_000)
+        self.set_pending_new_folder_parent(None)
+        return output
 
     def cancel_running_prompt(self) -> str:
         with self.running_lock:
@@ -726,8 +809,25 @@ class DirectTelegramCodexBot:
         if not text:
             return
         message_id = int(message.get("message_id"))
+        pending_parent = self.pending_new_folder_parent()
         command = parse_command(text)
         if not command:
+            if pending_parent is not None:
+                if self.current_runtime_status()[0] == "busy":
+                    self.api.send_message(chat_id, "작업 중에는 새 폴더 세션을 만들 수 없습니다.", reply_to_message_id=message_id)
+                    return
+                try:
+                    output = self.create_new_folder_session(text)
+                except Exception as exc:
+                    self.api.send_message(
+                        chat_id,
+                        f"새 폴더 세션 생성에 실패했습니다.\n{exc}\n\n다시 이름을 보내거나 /cancel 을 누르세요.",
+                        reply_to_message_id=message_id,
+                    )
+                    return
+                self.api.send_message(chat_id, output, reply_to_message_id=message_id)
+                self.send_menu(chat_id, "resume")
+                return
             busy_error = self.start_prompt(chat_id, text, message_id)
             if busy_error:
                 self.api.send_message(chat_id, busy_error, reply_to_message_id=message_id)
@@ -767,6 +867,11 @@ class DirectTelegramCodexBot:
             self.api.send_message(chat_id, output, reply_to_message_id=message_id)
             return
         if name == "cancel":
+            if pending_parent is not None:
+                self.set_pending_new_folder_parent(None)
+                self.api.send_message(chat_id, "새 폴더 생성 입력을 취소했습니다.", reply_to_message_id=message_id)
+                self.send_menu(chat_id, "session-browser")
+                return
             output = self.cancel_running_prompt()
             self.api.send_message(chat_id, output, reply_to_message_id=message_id)
             return
@@ -787,6 +892,8 @@ class DirectTelegramCodexBot:
         kind, value = action
         try:
             if kind == "menu":
+                if value != "session-browser":
+                    self.set_pending_new_folder_parent(None)
                 self.send_menu(chat_id, value or "help")
                 self.api.answer_callback_query(callback_id)
                 return
@@ -801,6 +908,12 @@ class DirectTelegramCodexBot:
                 self.api.answer_callback_query(callback_id)
                 return
             if kind == "cancel":
+                if self.pending_new_folder_parent() is not None:
+                    self.set_pending_new_folder_parent(None)
+                    self.api.send_message(chat_id, "새 폴더 생성 입력을 취소했습니다.")
+                    self.send_menu(chat_id, "session-browser")
+                    self.api.answer_callback_query(callback_id, "입력 취소")
+                    return
                 output = self.cancel_running_prompt()
                 self.api.send_message(chat_id, output)
                 self.api.answer_callback_query(callback_id)
@@ -838,6 +951,7 @@ class DirectTelegramCodexBot:
                     self.api.answer_callback_query(callback_id, "브라우저를 새로고침했습니다.")
                     return
                 if subaction == "up":
+                    self.set_pending_new_folder_parent(None)
                     self.set_session_browser_state(current_path.parent if current_path.parent != current_path else current_path, 0)
                     self.send_menu(chat_id, "session-browser")
                     self.api.answer_callback_query(callback_id)
@@ -847,6 +961,7 @@ class DirectTelegramCodexBot:
                         target_page = max(int(parts[2]), 0)
                     except ValueError:
                         target_page = 0
+                    self.set_pending_new_folder_parent(None)
                     self.set_session_browser_state(current_path, target_page)
                     self.send_menu(chat_id, "session-browser")
                     self.api.answer_callback_query(callback_id)
@@ -863,14 +978,29 @@ class DirectTelegramCodexBot:
                         self.send_menu(chat_id, "session-browser", notice="선택한 폴더를 다시 골라주세요.")
                         self.api.answer_callback_query(callback_id, "폴더 목록이 바뀌었습니다.")
                         return
+                    self.set_pending_new_folder_parent(None)
                     self.set_session_browser_state(visible[index], 0)
                     self.send_menu(chat_id, "session-browser")
                     self.api.answer_callback_query(callback_id)
+                    return
+                if subaction == "mkdir":
+                    if self.current_runtime_status()[0] == "busy":
+                        self.api.answer_callback_query(callback_id, "작업 중에는 새 폴더 세션을 만들 수 없습니다.")
+                        return
+                    self.set_pending_new_folder_parent(current_path)
+                    self.api.send_message(
+                        chat_id,
+                        "새 폴더 이름을 다음 메시지로 보내세요.\n"
+                        f"- parent: {current_path}\n"
+                        "- 취소하려면 /cancel",
+                    )
+                    self.api.answer_callback_query(callback_id, "폴더 이름 입력 대기")
                     return
                 if subaction == "create":
                     if self.current_runtime_status()[0] == "busy":
                         self.api.answer_callback_query(callback_id, "작업 중에는 새 세션을 만들 수 없습니다.")
                         return
+                    self.set_pending_new_folder_parent(None)
                     output = self.run_bridge(["new-session", str(current_path)], timeout_ms=120_000)
                     self.api.send_message(chat_id, output)
                     self.send_menu(chat_id, "resume")
