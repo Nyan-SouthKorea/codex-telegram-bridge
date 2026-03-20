@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ WORKDIR = Path(os.environ.get("CODEX_TELEGRAM_BRIDGE_DEFAULT_WORKDIR") or REPO_R
 STATE_PATH = Path(os.environ.get("CODEX_TELEGRAM_BRIDGE_STATE_PATH") or (RELAY_DIR / "state" / "codex_bridge_state.json")).expanduser()
 CODEX_HOME = Path.home() / ".codex"
 SESSIONS_ROOT = CODEX_HOME / "sessions"
+SESSION_INDEX_PATH = CODEX_HOME / "session_index.jsonl"
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 COMMON_MODEL_IDS = [
     "gpt-5.4",
@@ -210,6 +212,69 @@ def current_scope_cwd(state: dict[str, Any]) -> str:
     return normalized_dir_string(state.get("session_scope_cwd")) or normalized_dir_string(state.get("workdir")) or str(WORKDIR)
 
 
+def parse_session_index_updated_at(value: Any) -> int | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    match = re.match(
+        r"^(?P<head>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?P<frac>\.\d+)?(?P<tz>Z|[+-]\d{2}:\d{2})?$",
+        raw,
+    )
+    if not match:
+        return None
+    fraction = match.group("frac") or ""
+    if fraction:
+        fraction = "." + fraction[1:7].ljust(6, "0")
+    timezone_text = match.group("tz") or "+00:00"
+    if timezone_text == "Z":
+        timezone_text = "+00:00"
+    normalized = f"{match.group('head')}{fraction}{timezone_text}"
+    try:
+        return int(datetime.fromisoformat(normalized).timestamp())
+    except ValueError:
+        return None
+
+
+def load_session_index_titles() -> dict[str, tuple[str, int | None]]:
+    if not SESSION_INDEX_PATH.exists():
+        return {}
+    titles: dict[str, tuple[str, int | None]] = {}
+    try:
+        with SESSION_INDEX_PATH.open("r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                thread_id = str(payload.get("id") or "").strip()
+                thread_name = str(payload.get("thread_name") or "").strip()
+                if not thread_id or not thread_name:
+                    continue
+                titles[thread_id] = (thread_name, parse_session_index_updated_at(payload.get("updated_at")))
+    except Exception:
+        return {}
+    return titles
+
+
+def preferred_thread_title(
+    thread_id: str,
+    db_title: str,
+    thread_updated_at: int,
+    session_index_titles: dict[str, tuple[str, int | None]] | None = None,
+) -> str:
+    titles = session_index_titles if session_index_titles is not None else load_session_index_titles()
+    override = titles.get(thread_id)
+    if not override:
+        return db_title
+    override_title, override_updated_at = override
+    if override_updated_at is not None and override_updated_at < thread_updated_at:
+        return db_title
+    return override_title or db_title
+
+
 def list_threads(limit: int = 20, cwd_filter: str | None = None, recursive: bool = False) -> list[ThreadEntry]:
     query = """
         select id, title, cwd, created_at, updated_at, rollout_path, sandbox_policy, approval_mode, model_provider, cli_version
@@ -229,10 +294,16 @@ def list_threads(limit: int = 20, cwd_filter: str | None = None, recursive: bool
     params.append(max(limit, 1))
     with open_state_db() as conn:
         rows = conn.execute(query, tuple(params)).fetchall()
+    session_index_titles = load_session_index_titles()
     return [
         ThreadEntry(
             id=str(row["id"]),
-            title=str(row["title"]),
+            title=preferred_thread_title(
+                str(row["id"]),
+                str(row["title"]),
+                int(row["updated_at"]),
+                session_index_titles,
+            ),
             cwd=str(row["cwd"]),
             created_at=int(row["created_at"]),
             updated_at=int(row["updated_at"]),
@@ -258,7 +329,7 @@ def get_thread(thread_id: str) -> ThreadEntry | None:
         return None
     return ThreadEntry(
         id=str(row["id"]),
-        title=str(row["title"]),
+        title=preferred_thread_title(str(row["id"]), str(row["title"]), int(row["updated_at"])),
         cwd=str(row["cwd"]),
         created_at=int(row["created_at"]),
         updated_at=int(row["updated_at"]),
@@ -771,6 +842,27 @@ def cmd_new_session(state: dict[str, Any], cwd_arg: str | None) -> str:
     return detail
 
 
+def cmd_close_session(state: dict[str, Any]) -> str:
+    sync_state_to_threads(state)
+    active_id = str(state.get("active_session_id") or "").strip()
+    if not active_id:
+        return "현재 종료할 Codex 세션이 없습니다."
+    target = get_thread(active_id)
+    active_name = str(state.get("active_session_name") or "").strip() or (target.title if target else "-")
+    active_cwd = target.cwd if target else str(state.get("workdir") or "-")
+    state["active_session_id"] = None
+    state["active_session_name"] = None
+    save_state(state)
+    return (
+        "현재 Codex 세션을 종료했습니다.\n"
+        f"- id: {active_id}\n"
+        f"- name: {active_name}\n"
+        f"- cwd: {active_cwd}\n"
+        "- 세션 기록은 유지되며 나중에 다시 이어서 열 수 있습니다.\n"
+        "- 다음 평문부터는 새 active 세션으로 시작합니다."
+    )
+
+
 def cmd_delete_session(state: dict[str, Any], selector: str | None) -> str:
     threads = sync_state_to_threads(state)
     store_last_list(state, threads)
@@ -947,6 +1039,7 @@ def cmd_commands() -> str:
             "- /set-workdir <cwd>: /resume 목록 기준 디렉토리 변경",
             "- /fast: Codex Fast mode 토글",
             "- /new-session <cwd>: 지정한 폴더로 새 Codex 세션 생성",
+            "- /close-session: 현재 active Codex 세션 종료 (/exit와 동일하게 기록은 유지)",
             "- /delete-session: 현재 active Codex 세션 삭제",
             "- /read: 최근 Codex 기록 읽기",
             "- /cancel: 현재 Codex 실행 취소",
@@ -994,6 +1087,9 @@ def main() -> int:
         if command == "new-session":
             selector = " ".join(args[1:]).strip() if len(args) > 1 else None
             print(cmd_new_session(state, selector))
+            return 0
+        if command == "close-session":
+            print(cmd_close_session(state))
             return 0
         if command == "delete-session":
             selector = " ".join(args[1:]).strip() if len(args) > 1 else None

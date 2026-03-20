@@ -1,6 +1,8 @@
 import json
+import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
@@ -86,7 +88,7 @@ class SimulatedBot(DirectTelegramCodexBot):
                     "cwd": str(Path(self.config.workdir) / "project-a"),
                     "createdAt": 101,
                     "updatedAt": 111,
-                    "active": True,
+                    "active": self.fake_state.get("active_session_id") == "sess-active",
                 },
                 {
                     "id": "sess-2",
@@ -94,7 +96,7 @@ class SimulatedBot(DirectTelegramCodexBot):
                     "cwd": str(Path(self.config.workdir) / "project-b"),
                     "createdAt": 100,
                     "updatedAt": 110,
-                    "active": False,
+                    "active": self.fake_state.get("active_session_id") == "sess-2",
                 },
                 {
                     "id": "sess-3",
@@ -102,7 +104,7 @@ class SimulatedBot(DirectTelegramCodexBot):
                     "cwd": str(Path(self.config.workdir) / "project-a" / "nested"),
                     "createdAt": 99,
                     "updatedAt": 109,
-                    "active": False,
+                    "active": self.fake_state.get("active_session_id") == "sess-3",
                 },
             ]
             if len(args) >= 3:
@@ -133,6 +135,19 @@ class SimulatedBot(DirectTelegramCodexBot):
             self.fake_state["active_session_name"] = "[tg] ~/new-project"
             self.fake_state["workdir"] = args[1]
             return f"Codex 새 세션을 만들었습니다.\n- id: sess-new\n- cwd: {args[1]}\n- title: [tg] ~/new-project"
+        if args[:1] == ["close-session"]:
+            active_id = self.fake_state.get("active_session_id")
+            active_name = self.fake_state.get("active_session_name")
+            self.fake_state["active_session_id"] = None
+            self.fake_state["active_session_name"] = None
+            return (
+                "현재 Codex 세션을 종료했습니다.\n"
+                f"- id: {active_id}\n"
+                f"- name: {active_name}\n"
+                f"- cwd: {self.fake_state.get('workdir')}\n"
+                "- 세션 기록은 유지되며 나중에 다시 이어서 열 수 있습니다.\n"
+                "- 다음 평문부터는 새 active 세션으로 시작합니다."
+            )
         if args[:1] == ["set-workdir"]:
             self.fake_state["session_scope_cwd"] = args[1]
             return (
@@ -209,7 +224,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertEqual(sent["inline_keyboard"][1][0]["text"], "Fast")
         self.assertIn("현재 Fast mode: off", sent["text"])
 
-    def test_resume_menu_includes_create_and_delete_buttons(self):
+    def test_resume_menu_includes_close_and_delete_buttons(self):
         self.bot.fake_state["session_scope_cwd"] = str(Path(self.bot.config.workdir) / "project-a")
         self.bot.write_runtime_state(session_scope_initialized=True, session_scope_user_selected=True)
         text, buttons = self.bot.build_resume_menu()
@@ -219,7 +234,8 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertIn(str(Path(self.bot.config.workdir) / "project-a"), text)
         self.assertEqual(buttons[0][0]["text"], "디렉토리 설정")
         self.assertEqual(buttons[0][1]["text"], "새 세션 만들기")
-        self.assertEqual(buttons[1][0]["text"], "현재 세션 삭제")
+        self.assertEqual(buttons[1][0]["text"], "현재 세션 종료")
+        self.assertEqual(buttons[1][1]["text"], "현재 세션 삭제")
         self.assertIn("Primary Session", buttons[2][0]["text"])
 
     def test_resume_menu_filters_sessions_by_current_directory(self):
@@ -435,6 +451,24 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertIn("relay> delete-session", self.bot.api.sent[0]["text"])
         self.assertIn("현재 Codex 세션을 삭제했습니다.", self.bot.api.sent[0]["text"])
 
+    def test_session_close_closes_current_active_session_without_archiving(self):
+        self.bot.fake_state["session_scope_cwd"] = str(Path(self.bot.config.workdir) / "project-a")
+        self.bot.write_runtime_state(session_scope_initialized=True, session_scope_user_selected=True)
+        self.bot.handle_callback(
+            {
+                "id": "cb-6",
+                "data": "tgbtn:session:close",
+                "message": {"chat": {"id": 111111111}},
+            }
+        )
+        self.assertEqual(self.bot.bridge_calls[0]["args"], ["close-session"])
+        self.assertIn("relay> close-session", self.bot.api.sent[0]["text"])
+        self.assertIn("현재 Codex 세션을 종료했습니다.", self.bot.api.sent[0]["text"])
+        self.assertIsNone(self.bot.fake_state["active_session_id"])
+        self.assertEqual(self.bot.fake_state["last_execution_session_id"], "sess-active")
+        self.assertIn("현재 세션: (none)", self.bot.api.sent[1]["text"])
+        self.assertIn("Primary Session", self.bot.api.sent[1]["text"])
+
     def test_unknown_command_redirects_to_help(self):
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 80, "text": "/unknown"})
         self.assertIn("슬래시 명령은 /help만 지원합니다.", self.bot.api.sent[-1]["text"])
@@ -522,10 +556,161 @@ class CodexBridgeUnitTests(unittest.TestCase):
         self.assertIn("fast_mode=true", output)
         self.assertIn("2X plan usage", output)
 
+    def test_cmd_close_session_clears_active_only(self):
+        state = {
+            "active_session_id": "sess-active",
+            "active_session_name": "Primary Session",
+            "workdir": "/tmp/project-a",
+            "last_execution_session_id": "sess-active",
+            "last_execution_session_name": "Primary Session",
+        }
+        thread = bridge.ThreadEntry(
+            id="sess-active",
+            title="Primary Session",
+            cwd="/tmp/project-a",
+            created_at=100,
+            updated_at=200,
+            rollout_path="/tmp/project-a/rollout.jsonl",
+            sandbox_policy="danger-full-access",
+            approval_mode="never",
+            model_provider="openai",
+            cli_version="0.0.0",
+        )
+
+        with patch.object(bridge, "sync_state_to_threads"), patch.object(bridge, "get_thread", return_value=thread), patch.object(
+            bridge, "save_state"
+        ) as save_state:
+            output = bridge.cmd_close_session(state)
+
+        self.assertIsNone(state["active_session_id"])
+        self.assertIsNone(state["active_session_name"])
+        self.assertEqual(state["last_execution_session_id"], "sess-active")
+        self.assertIn("현재 Codex 세션을 종료했습니다.", output)
+        self.assertIn("세션 기록은 유지되며 나중에 다시 이어서 열 수 있습니다.", output)
+        save_state.assert_called_once_with(state)
+
     def test_current_scope_cwd_uses_separate_scope_field(self):
         state = {"workdir": "/tmp/active", "session_scope_cwd": "/tmp/scope"}
 
         self.assertEqual(bridge.current_scope_cwd(state), "/tmp/scope")
+
+    def create_state_db(self, path: Path, *, thread_id: str, title: str, updated_at: int):
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """
+            create table threads (
+                id text primary key,
+                rollout_path text not null,
+                created_at integer not null,
+                updated_at integer not null,
+                source text not null,
+                model_provider text not null,
+                cwd text not null,
+                title text not null,
+                sandbox_policy text not null,
+                approval_mode text not null,
+                tokens_used integer not null default 0,
+                has_user_event integer not null default 0,
+                archived integer not null default 0,
+                archived_at integer,
+                git_sha text,
+                git_branch text,
+                git_origin_url text,
+                cli_version text not null default '',
+                first_user_message text not null default '',
+                agent_nickname text,
+                agent_role text,
+                memory_mode text not null default 'enabled',
+                model text,
+                reasoning_effort text
+            )
+            """
+        )
+        conn.execute(
+            """
+            insert into threads (
+                id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                sandbox_policy, approval_mode, archived, cli_version
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                thread_id,
+                str(path.with_suffix(".jsonl")),
+                100,
+                updated_at,
+                "cli",
+                "openai",
+                "/tmp/project-a",
+                title,
+                "danger-full-access",
+                "never",
+                "0.0.0",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    def session_index_timestamp(self, epoch_seconds: int) -> str:
+        return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def test_cmd_sessions_json_prefers_renamed_session_index_name(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            db_path = tmpdir_path / "state.sqlite"
+            state_path = tmpdir_path / "bridge_state.json"
+            session_index_path = tmpdir_path / "session_index.jsonl"
+            self.create_state_db(db_path, thread_id="sess-1", title="Original Title", updated_at=100)
+            session_index_path.write_text(
+                json.dumps(
+                    {
+                        "id": "sess-1",
+                        "thread_name": "Renamed From TUI",
+                        "updated_at": self.session_index_timestamp(200),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state = {
+                "active_session_id": "sess-1",
+                "active_session_name": "Original Title",
+                "workdir": "/tmp/project-a",
+                "session_scope_cwd": "/tmp/project-a",
+                "last_list": [],
+            }
+
+            with patch.object(bridge, "STATE_PATH", state_path), patch.object(bridge, "SESSION_INDEX_PATH", session_index_path), patch.object(
+                bridge, "state_db_path", return_value=db_path
+            ):
+                payload = json.loads(bridge.cmd_sessions_json(state, "5", "/tmp/project-a"))
+
+            self.assertEqual(payload[0]["name"], "Renamed From TUI")
+            self.assertEqual(state["active_session_name"], "Renamed From TUI")
+
+    def test_list_threads_keeps_newer_db_title_when_session_index_is_stale(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            db_path = tmpdir_path / "state.sqlite"
+            session_index_path = tmpdir_path / "session_index.jsonl"
+            self.create_state_db(db_path, thread_id="sess-1", title="[tg] ~/project-a", updated_at=300)
+            session_index_path.write_text(
+                json.dumps(
+                    {
+                        "id": "sess-1",
+                        "thread_name": "Old Picker Name",
+                        "updated_at": self.session_index_timestamp(200),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(bridge, "SESSION_INDEX_PATH", session_index_path), patch.object(bridge, "state_db_path", return_value=db_path):
+                threads = bridge.list_threads(limit=5, cwd_filter="/tmp/project-a")
+
+            self.assertEqual(threads[0].title, "[tg] ~/project-a")
 
 
 if __name__ == "__main__":

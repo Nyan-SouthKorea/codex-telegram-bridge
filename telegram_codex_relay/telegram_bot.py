@@ -505,6 +505,7 @@ class DirectTelegramCodexBot:
                 "- 설정과 조회는 버튼으로만 합니다.",
                 "- 권한이 full이면 지속 세션, read/deny면 격리 1회 실행입니다.",
                 "- 세션 메뉴의 `디렉토리 설정`으로 /resume 기준 폴더를 바꿀 수 있습니다.",
+                "- 세션 메뉴의 `현재 세션 종료`는 `/exit`처럼 현재 세션만 닫고 기록은 유지합니다.",
                 "- `Fast`는 실제 Codex Fast mode 토글입니다.",
                 "",
                 f"현재 모델: {format_state_value(state.get('model'))}",
@@ -559,6 +560,7 @@ class DirectTelegramCodexBot:
         )
         rows.append(
             [
+                {"text": "현재 세션 종료", "callback_data": button_data("session", "close")},
                 {"text": "현재 세션 삭제", "callback_data": button_data("session", "delete")},
             ]
         )
@@ -1136,6 +1138,15 @@ class DirectTelegramCodexBot:
                 self.api.send_message(chat_id, self.render_cli_message("relay", "delete-session", output))
                 self.send_menu(chat_id, "resume")
                 self.api.answer_callback_query(callback_id, "현재 세션 삭제 완료")
+                return
+            if kind == "session" and value == "close":
+                if self.current_runtime_status()[0] == "busy":
+                    self.api.answer_callback_query(callback_id, "작업 중에는 현재 세션을 종료할 수 없습니다.")
+                    return
+                output = self.run_bridge(["close-session"])
+                self.api.send_message(chat_id, self.render_cli_message("relay", "close-session", output))
+                self.send_menu(chat_id, "resume")
+                self.api.answer_callback_query(callback_id, "현재 세션 종료 완료")
                 return
             if kind == "sessbrowse" and value:
                 parts = value.split("|")

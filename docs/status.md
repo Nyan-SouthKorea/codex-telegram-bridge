@@ -30,6 +30,7 @@
   - `디렉토리 설정`
   - 최근 세션 선택
   - `새 세션 만들기`
+  - `현재 세션 종료`
   - `현재 세션 삭제`
 - 봇이 처음 세션 메뉴를 열 때, 별도 사용자 선택 이력이 없으면 `config.workdir`를 `/resume` 기본 기준 폴더로 자동 동기화
 - 세션 목록은 현재 디렉토리와 동일한 `cwd` 세션만 표시
@@ -47,6 +48,8 @@
   - `../` 버튼으로 상위 폴더 이동
   - `현재 폴더로 세션 시작`
   - `새 폴더 만들기`를 누른 뒤 다음 일반 메시지로 폴더 이름을 보내 새 폴더 생성 후 세션 시작
+- 현재 세션 종료는 active 세션만 해제하고 archive하지 않음
+- 현재 세션 종료 뒤 다음 평문은 새 active 세션으로 시작하고, 종료한 세션은 나중에 다시 resume 가능
 - 현재 세션 삭제는 active 세션만 archive 처리
 - `최근 출력`은 현재 active 세션을 우선 기준으로 읽음
 - `현재 상태`는 아래 값을 보여줌
@@ -96,6 +99,7 @@
 - 실제 `Codex bridge`로 새 세션 생성 확인
 - 실제 `Codex bridge`로 `resume -> read` 즉시 확인
 - 실제 `Codex bridge`로 최소 프롬프트 실행 확인
+- 단위/시뮬레이션으로 현재 세션 종료가 archive 없이 active만 해제하는 것 확인
 - 실제 `Codex bridge`로 현재 세션 archive 삭제 확인
 - `scripts/get_chat_id.py` 실행 확인
 - `systemd --user` 서비스 설치 스크립트로 실제 서비스 기동 확인
@@ -104,7 +108,9 @@
 
 2026-03-20 로컬 검증 기준:
 
-- `scripts/run_tests.sh` 26개 통과
+- `scripts/run_tests.sh` 30개 통과
+- `python3 -m py_compile telegram_codex_relay/telegram_bot.py telegram_codex_relay/bin/codex-bridge telegram_codex_relay/tests/test_simulation.py` 통과
+- `현재 세션 종료` 버튼과 `close-session`이 archive 없이 active 세션만 해제하는 시뮬레이션/단위 테스트 통과
 - 새 레포 경로의 `codex-bridge`로 `new-session -> prompt -> delete-session` 실검증 완료
 - 새 레포 경로의 `codex-bridge`로 `resume -> read -> restore` 실검증 완료
 - 새 레포 경로의 `codex-bridge`로 `fast off -> status -> fast on -> status` 실검증 완료

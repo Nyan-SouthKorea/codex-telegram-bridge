@@ -84,6 +84,11 @@ systemctl --user status codex-telegram-bridge.service
 - 상태/설정 결과는 `relay> ...`
 - 오류는 `error> ...`
 
+세션 관리 메모:
+
+- 세션 메뉴의 `현재 세션 종료`는 터미널 `codex`의 `/exit`와 같은 의미로 active 세션만 닫고 기록은 유지합니다.
+- 세션 메뉴의 `현재 세션 삭제`는 active 세션을 archive 처리합니다.
+
 ## 7. smoke test 예시
 
 Telegram에서 순서대로:
