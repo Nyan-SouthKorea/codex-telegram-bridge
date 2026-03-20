@@ -10,6 +10,7 @@ scripts/install_user_service.sh
 
 - `~/.config/systemd/user/codex-telegram-bridge.service`
 - 레포 내부 런타임: `.venv/bin/python`
+- conda base는 서비스 런타임으로 사용하지 않음
 
 ## 부팅 후 자동 시작
 

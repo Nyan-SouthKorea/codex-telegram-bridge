@@ -105,12 +105,13 @@
 - 새 레포 경로의 `codex-bridge`로 `new-session -> prompt -> delete-session` 실검증 완료
 - 새 레포 경로의 `codex-bridge`로 `resume -> read -> restore` 실검증 완료
 - 새 레포 경로의 `codex-bridge`로 `fast off -> status -> fast on -> status` 실검증 완료
-- 새 레포 경로의 `codex-bridge`로 `set-workdir /data2/iena -> sessions-json`, `set-workdir /data2/iena/260319_agent_test -> sessions-json` 실검증 완료
+- 새 레포 경로의 `codex-bridge`로 서로 다른 작업 디렉토리에 대해 `set-workdir -> sessions-json` 실검증 완료
 - 실제 `Codex CLI` 도움말 기준 `resume --all`이 cwd filtering 해제 옵션임을 확인했고, 브리지는 기본값을 동일 cwd 필터로 맞춤
 - Telegram Bot API `getMyCommands` 기준 `/help`만 등록된 것 확인
 - `codex-telegram-bridge.service` 재시작 후 `active` 확인
 - `codex-telegram-bridge.service`가 `/data2/iena/codex-telegram-bridge/.venv/bin/python`으로 실행되는 것 확인
 - 현재 운영 서비스는 conda base가 아니라 레포 내부 `.venv`만 사용
+- 설치 스크립트와 서비스는 conda base에 패키지를 설치하지 않음
 - 현재 서버에서 `systemctl --user is-enabled codex-telegram-bridge.service` = `enabled` 확인
 - 현재 서버에서 `loginctl show-user ubuntu -p Linger` = `Linger=yes` 확인
 - 기존 사용자 서비스 `telegram-codex-relay.service`는 중지했고, 현재는 `codex-telegram-bridge.service`가 새 레포 경로를 사용 중

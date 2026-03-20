@@ -8,6 +8,8 @@
 
 ## 문서 역할
 
+- [../AGENTS.md](../AGENTS.md)
+  에이전트가 먼저 발견하는 엔트리포인트 파일이며, 실제 규칙 본문은 `docs/agent.md`만 사용
 - [docs/status.md](status.md)
   현재 구조, 현재 기능, 현재 제약, 현재 검증 상태를 기록하는 기준 문서
 - [docs/architecture.md](architecture.md)
@@ -24,6 +26,7 @@
 ## 문서 규칙
 
 - 현재 사실은 `docs/status.md`를 우선합니다.
+- `AGENTS.md`는 포인터만 두고, 규칙 본문은 `docs/agent.md` 하나에만 둡니다.
 - 상세 설정법은 setup 문서에 둡니다.
 - 운영 명령은 operations 문서에 둡니다.
 - 동일 내용을 여러 문서에 중복으로 길게 복사하지 않습니다.
