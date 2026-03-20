@@ -1,0 +1,7 @@
+/.pytest_cache/
+/telegram_codex_relay/__pycache__/
+/telegram_codex_relay/bin/__pycache__/
+/telegram_codex_relay/tests/__pycache__/
+/telegram_codex_relay/config.json
+/telegram_codex_relay/state/
+*.pyc

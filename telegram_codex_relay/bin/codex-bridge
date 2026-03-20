@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+RELAY_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = RELAY_DIR.parent
+WORKDIR = Path(os.environ.get("CODEX_TELEGRAM_BRIDGE_DEFAULT_WORKDIR") or REPO_ROOT).expanduser()
+STATE_PATH = Path(os.environ.get("CODEX_TELEGRAM_BRIDGE_STATE_PATH") or (RELAY_DIR / "state" / "codex_bridge_state.json")).expanduser()
+CODEX_HOME = Path.home() / ".codex"
+SESSIONS_ROOT = CODEX_HOME / "sessions"
+CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
+COMMON_MODEL_IDS = [
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2-codex",
+    "gpt-5.2",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+]
+MODEL_ALIASES = {
+    "54": "gpt-5.4",
+    "gpt54": "gpt-5.4",
+    "54mini": "gpt-5.4-mini",
+    "gpt54mini": "gpt-5.4-mini",
+    "53": "gpt-5.3-codex",
+    "53codex": "gpt-5.3-codex",
+    "gpt53codex": "gpt-5.3-codex",
+    "spark": "gpt-5.3-codex-spark",
+    "53spark": "gpt-5.3-codex-spark",
+    "53codexspark": "gpt-5.3-codex-spark",
+    "gpt53codexspark": "gpt-5.3-codex-spark",
+    "52": "gpt-5.2",
+    "gpt52": "gpt-5.2",
+    "52codex": "gpt-5.2-codex",
+    "gpt52codex": "gpt-5.2-codex",
+    "51max": "gpt-5.1-codex-max",
+    "gpt51codexmax": "gpt-5.1-codex-max",
+    "51mini": "gpt-5.1-codex-mini",
+    "gpt51codexmini": "gpt-5.1-codex-mini",
+}
+SESSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,}$")
+
+
+@dataclass
+class ThreadEntry:
+    id: str
+    title: str
+    cwd: str
+    updated_at: int
+    rollout_path: str
+    sandbox_policy: str
+    approval_mode: str
+    model_provider: str
+    cli_version: str
+
+
+def normalize_model_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    squashed = re.sub(r"[^a-z0-9]+", "", lowered)
+    return MODEL_ALIASES.get(squashed, raw)
+
+
+def state_template() -> dict[str, Any]:
+    return {
+        "version": 2,
+        "workdir": str(WORKDIR),
+        "permission": "full",
+        "model": "gpt-5.4",
+        "reasoning_effort": "low",
+        "active_session_id": None,
+        "active_session_name": None,
+        "last_execution_session_id": None,
+        "last_execution_session_name": None,
+        "last_list": [],
+    }
+
+
+def load_state() -> dict[str, Any]:
+    if STATE_PATH.exists():
+        try:
+            data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            state = state_template()
+            state.update(
+                {
+                    "workdir": data.get("workdir") or state["workdir"],
+                    "permission": data.get("permission") or state["permission"],
+                    "model": normalize_model_value(data.get("model")) or None,
+                    "reasoning_effort": data.get("reasoning_effort") or state["reasoning_effort"],
+                    "active_session_id": data.get("active_session_id"),
+                    "active_session_name": data.get("active_session_name"),
+                    "last_execution_session_id": data.get("last_execution_session_id") or data.get("active_session_id"),
+                    "last_execution_session_name": data.get("last_execution_session_name") or data.get("active_session_name"),
+                    "last_list": data.get("last_list") or [],
+                }
+            )
+            save_state(state)
+            return state
+        except Exception:
+            pass
+    state = state_template()
+    newest = list_threads(limit=1)
+    if newest:
+        state["active_session_id"] = newest[0].id
+        state["active_session_name"] = newest[0].title
+        state["last_execution_session_id"] = newest[0].id
+        state["last_execution_session_name"] = newest[0].title
+    save_state(state)
+    return state
+
+
+def save_state(state: dict[str, Any]) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def state_db_path() -> Path:
+    candidates = sorted(CODEX_HOME.glob("state_*.sqlite"))
+    if candidates:
+        return candidates[-1]
+    fallback = CODEX_HOME / "state.sqlite"
+    if fallback.exists():
+        return fallback
+    raise RuntimeError("Codex state DB를 찾지 못했습니다.")
+
+
+def open_state_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(state_db_path()))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def list_threads(limit: int = 20, cwd_filter: str | None = None) -> list[ThreadEntry]:
+    query = """
+        select id, title, cwd, updated_at, rollout_path, sandbox_policy, approval_mode, model_provider, cli_version
+        from threads
+        where archived = 0
+    """
+    params: list[Any] = []
+    if cwd_filter:
+        query += " and cwd = ?"
+        params.append(cwd_filter)
+    query += " order by updated_at desc limit ?"
+    params.append(max(limit, 1))
+    with open_state_db() as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+    return [
+        ThreadEntry(
+            id=str(row["id"]),
+            title=str(row["title"]),
+            cwd=str(row["cwd"]),
+            updated_at=int(row["updated_at"]),
+            rollout_path=str(row["rollout_path"]),
+            sandbox_policy=str(row["sandbox_policy"]),
+            approval_mode=str(row["approval_mode"]),
+            model_provider=str(row["model_provider"]),
+            cli_version=str(row["cli_version"]),
+        )
+        for row in rows
+    ]
+
+
+def get_thread(thread_id: str) -> ThreadEntry | None:
+    query = """
+        select id, title, cwd, updated_at, rollout_path, sandbox_policy, approval_mode, model_provider, cli_version
+        from threads
+        where id = ?
+    """
+    with open_state_db() as conn:
+        row = conn.execute(query, (thread_id,)).fetchone()
+    if not row:
+        return None
+    return ThreadEntry(
+        id=str(row["id"]),
+        title=str(row["title"]),
+        cwd=str(row["cwd"]),
+        updated_at=int(row["updated_at"]),
+        rollout_path=str(row["rollout_path"]),
+        sandbox_policy=str(row["sandbox_policy"]),
+        approval_mode=str(row["approval_mode"]),
+        model_provider=str(row["model_provider"]),
+        cli_version=str(row["cli_version"]),
+    )
+
+
+def sync_state_to_threads(state: dict[str, Any]) -> list[ThreadEntry]:
+    threads = list_threads(limit=20)
+    active_id = str(state.get("active_session_id") or "").strip()
+    if active_id:
+        match = next((entry for entry in threads if entry.id == active_id), None)
+        if match:
+            state["active_session_name"] = match.title
+            state["workdir"] = match.cwd
+        else:
+            thread = get_thread(active_id)
+            if thread:
+                state["active_session_name"] = thread.title
+                state["workdir"] = thread.cwd
+            else:
+                state["active_session_id"] = None
+                state["active_session_name"] = None
+    save_state(state)
+    return threads
+
+
+def permission_mode(value: str | None) -> str:
+    normalized = (value or "full").strip().lower()
+    if normalized in {"full", "all", "approve-all"}:
+        return "full"
+    if normalized in {"read", "readonly", "approve-reads"}:
+        return "read"
+    return "deny"
+
+
+def desired_approval_mode(permission: str) -> str:
+    normalized = permission_mode(permission)
+    if normalized == "deny":
+        return "untrusted"
+    return "never"
+
+
+def reasoning_mode(value: str | None) -> str | None:
+    if value is None:
+        return None
+    aliases = {
+        "low": "low",
+        "fast": "low",
+        "quick": "low",
+        "medium": "medium",
+        "normal": "medium",
+        "balanced": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "deep": "xhigh",
+        "max": "xhigh",
+    }
+    lowered = value.strip().lower()
+    if lowered in {"default", "reset", "off", "none", "clear", ""}:
+        return None
+    return aliases.get(lowered)
+
+
+def command_prefix_for_state(state: dict[str, Any], *, resume: bool, permission_override: str | None = None) -> list[str]:
+    args = [CODEX_BIN, "exec"]
+    if resume:
+        args.append("resume")
+    args.extend(["--json", "--skip-git-repo-check"])
+    model = normalize_model_value(state.get("model"))
+    if model:
+        args.extend(["-m", model])
+    permission = permission_mode(permission_override or state.get("permission"))
+    if permission == "full":
+        args.append("--dangerously-bypass-approvals-and-sandbox")
+    elif not resume:
+        approval = desired_approval_mode(permission)
+        args.extend(["-s", "read-only", "-c", f'ask_for_approval="{approval}"'])
+    reasoning = reasoning_mode(state.get("reasoning_effort"))
+    if reasoning:
+        args.extend(["-c", f'model_reasoning_effort="{reasoning}"'])
+    return args
+
+
+def run_codex_json(command: list[str], prompt_text: str, cwd: str | None = None) -> tuple[int, str, str]:
+    proc = subprocess.run(
+        command + ["-"],
+        input=prompt_text,
+        cwd=str(cwd or WORKDIR),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def parse_exec_json_output(stdout_text: str) -> tuple[str | None, list[str], list[str]]:
+    thread_id: str | None = None
+    messages: list[str] = []
+    warnings: list[str] = []
+    for raw in stdout_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("type") == "thread.started":
+            thread_id = payload.get("thread_id")
+            continue
+        if payload.get("type") != "item.completed":
+            continue
+        item = payload.get("item") or {}
+        item_type = item.get("type")
+        text = str(item.get("text") or item.get("message") or "").strip()
+        if not text:
+            continue
+        if item_type == "agent_message":
+            messages.append(text)
+        elif item_type == "error":
+            warnings.append(text)
+    return thread_id, messages, warnings
+
+
+def thread_output_messages(thread: ThreadEntry, limit: int = 20) -> list[str]:
+    path = Path(thread.rollout_path)
+    if not path.exists():
+        return []
+    messages: list[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") != "response_item":
+                continue
+            item = payload.get("payload") or {}
+            if item.get("type") == "message" and item.get("role") == "assistant":
+                parts = []
+                for block in item.get("content") or []:
+                    if block.get("type") == "output_text":
+                        text = str(block.get("text") or "").strip()
+                        if text:
+                            parts.append(text)
+                text = "\n".join(parts).strip()
+                if text:
+                    messages.append(text)
+            elif item.get("type") == "item.completed":
+                completed = item.get("item") or {}
+                if completed.get("type") == "agent_message":
+                    text = str(completed.get("text") or "").strip()
+                    if text:
+                        messages.append(text)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for text in messages:
+        if text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped[-max(limit, 1) :]
+
+
+def refresh_active_thread(state: dict[str, Any], thread_id: str | None) -> ThreadEntry | None:
+    if not thread_id:
+        return None
+    thread = get_thread(thread_id)
+    if not thread:
+        return None
+    state["active_session_id"] = thread.id
+    state["active_session_name"] = thread.title
+    state["workdir"] = thread.cwd
+    save_state(state)
+    return thread
+
+
+def record_last_execution(state: dict[str, Any], thread_id: str | None) -> ThreadEntry | None:
+    if not thread_id:
+        return None
+    thread = get_thread(thread_id)
+    if not thread:
+        return None
+    state["last_execution_session_id"] = thread.id
+    state["last_execution_session_name"] = thread.title
+    save_state(state)
+    return thread
+
+
+def active_thread_for_state(state: dict[str, Any]) -> ThreadEntry | None:
+    active_id = str(state.get("active_session_id") or "").strip()
+    if not active_id:
+        return None
+    return get_thread(active_id)
+
+
+def effective_cwd(state: dict[str, Any], thread: ThreadEntry | None = None) -> str:
+    if thread:
+        return thread.cwd
+    cwd = str(state.get("workdir") or "").strip()
+    if cwd:
+        return cwd
+    return str(WORKDIR)
+
+
+def session_title_for_cwd(cwd: str) -> str:
+    path = Path(cwd)
+    home = Path.home()
+    try:
+        relative = path.relative_to(home)
+        display = "~" if str(relative) == "." else f"~/{relative}"
+    except Exception:
+        display = str(path)
+    return f"[tg] {display}"
+
+
+def retitle_thread(thread_id: str, title: str) -> None:
+    with open_state_db() as conn:
+        conn.execute(
+            "update threads set title = ?, updated_at = ? where id = ?",
+            (title, int(time.time()), thread_id),
+        )
+        conn.commit()
+
+
+def archive_thread(thread_id: str) -> None:
+    now = int(time.time())
+    with open_state_db() as conn:
+        conn.execute(
+            "update threads set archived = 1, archived_at = ?, updated_at = ? where id = ?",
+            (now, now, thread_id),
+        )
+        conn.commit()
+
+
+def thread_context_stats(thread: ThreadEntry) -> dict[str, int] | None:
+    path = Path(thread.rollout_path)
+    if not path.exists():
+        return None
+    latest_window: int | None = None
+    latest_last_total: int | None = None
+    latest_total_usage: int | None = None
+    with path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") != "event_msg":
+                continue
+            event = payload.get("payload") or {}
+            if event.get("type") != "token_count":
+                continue
+            info = event.get("info") or {}
+            latest_window = int(info.get("model_context_window") or 0) or latest_window
+            last_usage = info.get("last_token_usage") or {}
+            total_usage = info.get("total_token_usage") or {}
+            last_total = int(last_usage.get("total_tokens") or 0)
+            total_all = int(total_usage.get("total_tokens") or 0)
+            if last_total > 0:
+                latest_last_total = last_total
+            if total_all > 0:
+                latest_total_usage = total_all
+    if latest_window is None and latest_last_total is None and latest_total_usage is None:
+        return None
+    remaining = None
+    if latest_window is not None and latest_last_total is not None:
+        remaining = max(latest_window - latest_last_total, 0)
+    return {
+        "model_context_window": latest_window or 0,
+        "last_turn_total_tokens": latest_last_total or 0,
+        "session_total_tokens": latest_total_usage or 0,
+        "remaining_context_approx": remaining or 0,
+    }
+
+
+def run_prompt(state: dict[str, Any], prompt_text: str) -> str:
+    prompt = prompt_text.strip()
+    if not prompt:
+        raise RuntimeError("Codex로 보낼 프롬프트가 비어 있습니다.")
+    permission = permission_mode(state.get("permission"))
+    active_thread = active_thread_for_state(state)
+    active_id = active_thread.id if active_thread else ""
+    target_cwd = effective_cwd(state, active_thread)
+    resume = permission == "full" and bool(active_thread)
+    command = command_prefix_for_state(state, resume=resume)
+    if resume:
+        command.append(active_id)
+    returncode, stdout_text, stderr_text = run_codex_json(command, prompt, cwd=target_cwd)
+    thread_id, messages, warnings = parse_exec_json_output(stdout_text)
+    if returncode != 0:
+        message = (stderr_text or stdout_text or "Codex 실행 실패").strip()
+        if "could not find session" in message.lower() or "no such" in message.lower():
+            state["active_session_id"] = None
+            state["active_session_name"] = None
+            save_state(state)
+        raise RuntimeError(message)
+    refreshed_active: ThreadEntry | None = None
+    if permission == "full":
+        refreshed_active = refresh_active_thread(state, thread_id or active_id or None)
+        record_last_execution(state, refreshed_active.id if refreshed_active else thread_id or active_id or None)
+    else:
+        record_last_execution(state, thread_id)
+    thread = refreshed_active or get_thread(thread_id or active_id or "")
+    if not messages and thread:
+        messages = thread_output_messages(thread, limit=1)
+    if not messages:
+        messages = ["(empty reply)"]
+    if warnings:
+        return "\n\n".join([*warnings, *messages]).strip()
+    return "\n\n".join(messages).strip()
+
+
+def format_sessions(threads: list[ThreadEntry], limit: int = 8) -> str:
+    rows = threads[: max(limit, 1)]
+    if not rows:
+        return "사용 가능한 Codex 세션이 없습니다."
+    lines = ["최근 Codex 세션:"]
+    for index, entry in enumerate(rows, start=1):
+        lines.append(f"{index}. {entry.id} | {entry.title} | {entry.cwd}")
+    lines.append("")
+    lines.append("사용 예시: /resume 1, /resume last, /resume current, /resume <session-id>")
+    return "\n".join(lines)
+
+
+def store_last_list(state: dict[str, Any], threads: list[ThreadEntry]) -> None:
+    state["last_list"] = [
+        {"id": entry.id, "name": entry.title, "updatedAt": entry.updated_at}
+        for entry in threads[:20]
+    ]
+    save_state(state)
+
+
+def resolve_selector(state: dict[str, Any], threads: list[ThreadEntry], selector: str) -> ThreadEntry | None:
+    raw = selector.strip()
+    if not raw:
+        return None
+    normalized = raw.lower()
+    if normalized == "last":
+        return threads[0] if threads else None
+    if normalized == "current":
+        active_id = str(state.get("active_session_id") or "").strip()
+        if active_id:
+            return next((entry for entry in threads if entry.id == active_id), None)
+        return threads[0] if threads else None
+    if raw.isdigit():
+        index = int(raw) - 1
+        last_list = state.get("last_list") or []
+        if 0 <= index < len(last_list):
+            wanted = str(last_list[index].get("id") or "").strip()
+            return next((entry for entry in threads if entry.id == wanted), None)
+        if 0 <= index < len(threads):
+            return threads[index]
+    if SESSION_ID_RE.match(raw):
+        return next((entry for entry in threads if entry.id == raw), None)
+    exact = next((entry for entry in threads if entry.title == raw), None)
+    if exact:
+        return exact
+    lowered = raw.lower()
+    return next((entry for entry in threads if lowered in entry.title.lower()), None)
+
+
+def cmd_sessions(state: dict[str, Any], limit_arg: str | None) -> str:
+    try:
+        limit = int(limit_arg) if limit_arg else 8
+    except ValueError:
+        limit = 8
+    threads = sync_state_to_threads(state)
+    store_last_list(state, threads)
+    return format_sessions(threads, limit)
+
+
+def cmd_sessions_json(state: dict[str, Any], limit_arg: str | None) -> str:
+    try:
+        limit = int(limit_arg) if limit_arg else 8
+    except ValueError:
+        limit = 8
+    threads = sync_state_to_threads(state)
+    store_last_list(state, threads)
+    active_id = str(state.get("active_session_id") or "").strip()
+    payload = [
+        {
+            "id": entry.id,
+            "name": entry.title,
+            "cwd": entry.cwd,
+            "updatedAt": entry.updated_at,
+            "active": entry.id == active_id,
+        }
+        for entry in threads[: max(limit, 1)]
+    ]
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def cmd_resume(state: dict[str, Any], selector: str | None) -> str:
+    threads = sync_state_to_threads(state)
+    store_last_list(state, threads)
+    if not selector:
+        return format_sessions(threads, 8)
+    target = resolve_selector(state, threads, selector)
+    if not target:
+        return f"선택한 세션을 찾지 못했습니다: {selector}"
+    state["active_session_id"] = target.id
+    state["active_session_name"] = target.title
+    state["workdir"] = target.cwd
+    save_state(state)
+    return f"Codex 세션을 전환했습니다.\n- id: {target.id}\n- name: {target.title}\n- cwd: {target.cwd}"
+
+
+def cmd_new_session(state: dict[str, Any], cwd_arg: str | None) -> str:
+    raw = str(cwd_arg or "").strip()
+    if not raw:
+        raise RuntimeError("새 세션을 만들 작업 디렉터리가 필요합니다.")
+    target = Path(raw).expanduser()
+    if not target.exists():
+        raise RuntimeError(f"디렉터리를 찾지 못했습니다: {target}")
+    if not target.is_dir():
+        raise RuntimeError(f"폴더가 아닙니다: {target}")
+    bootstrap_prompt = "Reply with TELEGRAM_SESSION_READY only."
+    session_state = dict(state)
+    session_state["reasoning_effort"] = "low"
+    command = command_prefix_for_state(session_state, resume=False, permission_override="full")
+    returncode, stdout_text, stderr_text = run_codex_json(command, bootstrap_prompt, cwd=str(target))
+    thread_id, messages, warnings = parse_exec_json_output(stdout_text)
+    if returncode != 0 or not thread_id:
+        message = (stderr_text or stdout_text or "새 Codex 세션 생성 실패").strip()
+        raise RuntimeError(message)
+    title = session_title_for_cwd(str(target))
+    retitle_thread(thread_id, title)
+    thread = refresh_active_thread(state, thread_id)
+    record_last_execution(state, thread_id)
+    if thread:
+        state["active_session_name"] = title
+        state["workdir"] = thread.cwd
+        save_state(state)
+    detail = f"Codex 새 세션을 만들었습니다.\n- id: {thread_id}\n- cwd: {target}\n- title: {title}"
+    if warnings:
+        detail = f"{detail}\n\n" + "\n".join(warnings)
+    return detail
+
+
+def cmd_delete_session(state: dict[str, Any], selector: str | None) -> str:
+    threads = sync_state_to_threads(state)
+    store_last_list(state, threads)
+    active_id = str(state.get("active_session_id") or "").strip()
+    target: ThreadEntry | None
+    if selector and selector.strip():
+        target = resolve_selector(state, threads, selector)
+    elif active_id:
+        target = get_thread(active_id)
+    else:
+        target = None
+    if not target:
+        return "현재 삭제할 Codex 세션이 없습니다."
+    archive_thread(target.id)
+    if state.get("active_session_id") == target.id:
+        state["active_session_id"] = None
+        state["active_session_name"] = None
+    if state.get("last_execution_session_id") == target.id:
+        state["last_execution_session_id"] = None
+        state["last_execution_session_name"] = None
+    updated_threads = list_threads(limit=20)
+    store_last_list(state, updated_threads)
+    save_state(state)
+    return f"현재 Codex 세션을 삭제했습니다.\n- id: {target.id}\n- name: {target.title}\n- cwd: {target.cwd}"
+
+
+def cmd_read(state: dict[str, Any], tail_arg: str | None) -> str:
+    try:
+        tail = int(tail_arg) if tail_arg else 5
+    except ValueError:
+        tail = 5
+    target_id = str(state.get("last_execution_session_id") or state.get("active_session_id") or "").strip()
+    if not target_id:
+        return "현재 활성 Codex 세션이 없습니다."
+    thread = get_thread(target_id)
+    if not thread:
+        state["last_execution_session_id"] = None
+        state["last_execution_session_name"] = None
+        save_state(state)
+        return "현재 활성 Codex 세션을 찾지 못했습니다."
+    messages = thread_output_messages(thread, limit=max(tail, 1))
+    if not messages:
+        return "읽을 수 있는 Codex 출력이 없습니다."
+    lines = [f"최근 Codex 출력 ({thread.title}):"]
+    for index, message in enumerate(messages, start=1):
+        lines.append("")
+        lines.append(f"[{index}]")
+        lines.append(message)
+    return "\n".join(lines)
+
+
+def cmd_status(state: dict[str, Any]) -> str:
+    threads = sync_state_to_threads(state)
+    active_id = str(state.get("active_session_id") or "").strip()
+    execution_id = str(state.get("last_execution_session_id") or "").strip()
+    active_thread = get_thread(active_id) if active_id else None
+    context_stats = thread_context_stats(active_thread) if active_thread else None
+    lines = [
+        "Codex relay 상태:",
+        f"- activeSessionId: {active_id or '-'}",
+        f"- activeSessionName: {state.get('active_session_name') or '-'}",
+        f"- activeSessionCwd: {active_thread.cwd if active_thread else state.get('workdir') or '-'}",
+        f"- lastExecutionSessionId: {execution_id or '-'}",
+        f"- lastExecutionSessionName: {state.get('last_execution_session_name') or '-'}",
+        f"- permission: {permission_mode(state.get('permission'))}",
+        f"- executionMode: {'persistent-resume' if permission_mode(state.get('permission')) == 'full' else 'isolated-one-turn'}",
+        f"- model: {state.get('model') or '(default)'}",
+        f"- reasoning: {state.get('reasoning_effort') or '(default)'}",
+        f"- sessionCount: {len(threads)}",
+    ]
+    if context_stats:
+        lines.extend(
+            [
+                f"- contextWindow: {context_stats['model_context_window'] or '-'}",
+                f"- lastTurnTokens: {context_stats['last_turn_total_tokens'] or '-'}",
+                f"- sessionTotalTokens: {context_stats['session_total_tokens'] or '-'}",
+                f"- remainingContextApprox: {context_stats['remaining_context_approx'] or '-'}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def cmd_model(state: dict[str, Any], value: str | None) -> str:
+    if not value or value.strip().lower() in {"show", "status"}:
+        return (
+            f"현재 Codex 모델 오버라이드: {state.get('model') or '(default)'}\n"
+            "모델 목록은 `/model list`로 볼 수 있습니다."
+        )
+    if value.strip().lower() in {"list", "ls"}:
+        return (
+            "Codex에서 자주 쓰는 모델 예시:\n"
+            f"- {', '.join(COMMON_MODEL_IDS)}\n"
+            "원하는 모델을 버튼 메뉴 또는 `/model <id>`로 지정할 수 있습니다."
+        )
+    normalized = normalize_model_value(value)
+    lowered = str(value).strip().lower()
+    if lowered in {"default", "reset", "off", "none", "clear"}:
+        changed = state.get("model") is not None
+        state["model"] = None
+        if changed:
+            state["active_session_id"] = None
+            state["active_session_name"] = None
+        save_state(state)
+        if changed:
+            return "Codex 모델 오버라이드를 기본값으로 되돌렸습니다.\n- 다음 프롬프트부터 새 active 세션으로 시작합니다."
+        return "Codex 모델 오버라이드를 기본값으로 되돌렸습니다."
+    changed = normalized != state.get("model")
+    state["model"] = normalized
+    if changed:
+        state["active_session_id"] = None
+        state["active_session_name"] = None
+    save_state(state)
+    if changed:
+        return (
+            f"Codex 모델 오버라이드를 저장했습니다: {normalized}\n"
+            "- 다음 프롬프트부터 새 active 세션으로 시작합니다."
+        )
+    return f"Codex 모델 오버라이드를 저장했습니다: {normalized}"
+
+
+def cmd_permission(state: dict[str, Any], value: str | None) -> str:
+    if not value or value.strip().lower() in {"show", "status"}:
+        return f"현재 Codex 권한 모드: {permission_mode(state.get('permission'))}"
+    normalized = permission_mode(value)
+    state["permission"] = normalized
+    save_state(state)
+    detail = {
+        "full": "persistent resume with danger-full-access",
+        "read": "isolated one-turn exec with read-only",
+        "deny": "isolated one-turn exec with read-only + untrusted approvals",
+    }[normalized]
+    return (
+        f"Codex 권한 모드를 {normalized}로 저장했습니다.\n"
+        f"- exec flags: {detail}"
+    )
+
+
+def cmd_thinking(state: dict[str, Any], value: str | None) -> str:
+    if not value or value.strip().lower() in {"show", "status"}:
+        return (
+            f"현재 Codex thinking 오버라이드: {state.get('reasoning_effort') or '(default)'}\n"
+            "사용 예시: /thinking fast, /thinking medium, /thinking high, /thinking xhigh"
+        )
+    normalized = reasoning_mode(value)
+    if normalized is None and value.strip().lower() not in {"default", "reset", "off", "none", "clear"}:
+        return "thinking 값은 fast(low), medium, high, xhigh 중 하나를 사용하세요."
+    state["reasoning_effort"] = normalized
+    save_state(state)
+    if normalized is None:
+        return "Codex thinking 오버라이드를 기본값으로 되돌렸습니다."
+    return f"Codex thinking 오버라이드를 저장했습니다: {normalized}"
+
+
+def cmd_commands() -> str:
+    return "\n".join(
+        [
+            "사용 가능한 브리지 명령:",
+            "- plain text: 활성 Codex 세션으로 전달",
+            "- /help: 텔레그램 버튼 메뉴와 사용법 표시",
+            "- /resume: 세션 메뉴와 최근 Codex 세션 버튼 표시",
+            "- /new-session <cwd>: 지정한 폴더로 새 Codex 세션 생성",
+            "- /delete-session: 현재 active Codex 세션 삭제",
+            "- /read: 최근 Codex 기록 읽기",
+            "- /cancel: 현재 Codex 실행 취소",
+            "- /status: 현재 relay 상태",
+            "- /model: 모델 버튼 메뉴",
+            "- /thinking: thinking 버튼 메뉴",
+            "- /permission: 권한 버튼 메뉴",
+            "- 설정 변경은 텔레그램에서 버튼으로만 선택",
+        ]
+    )
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    state = load_state()
+    if not args:
+        print(cmd_commands())
+        return 0
+    command = args[0].strip().lower()
+    try:
+        if command == "prompt":
+            text = " ".join(args[1:]).strip()
+            if not text:
+                text = sys.stdin.read()
+            print(run_prompt(state, text))
+            return 0
+        if command == "sessions":
+            print(cmd_sessions(state, args[1] if len(args) > 1 else None))
+            return 0
+        if command == "sessions-json":
+            print(cmd_sessions_json(state, args[1] if len(args) > 1 else None))
+            return 0
+        if command == "resume":
+            selector = " ".join(args[1:]).strip() if len(args) > 1 else None
+            print(cmd_resume(state, selector))
+            return 0
+        if command == "new-session":
+            selector = " ".join(args[1:]).strip() if len(args) > 1 else None
+            print(cmd_new_session(state, selector))
+            return 0
+        if command == "delete-session":
+            selector = " ".join(args[1:]).strip() if len(args) > 1 else None
+            print(cmd_delete_session(state, selector))
+            return 0
+        if command == "read":
+            print(cmd_read(state, args[1] if len(args) > 1 else None))
+            return 0
+        if command == "cancel":
+            print("cancel은 direct Telegram bot 런타임에서 처리합니다.")
+            return 0
+        if command in {"status", "relaystatus"}:
+            print(cmd_status(state))
+            return 0
+        if command in {"model", "codexmodel"}:
+            value = " ".join(args[1:]).strip() if len(args) > 1 else None
+            print(cmd_model(state, value))
+            return 0
+        if command in {"permission", "permision"}:
+            value = " ".join(args[1:]).strip() if len(args) > 1 else None
+            print(cmd_permission(state, value))
+            return 0
+        if command in {"thinking", "reasoning"}:
+            value = " ".join(args[1:]).strip() if len(args) > 1 else None
+            print(cmd_thinking(state, value))
+            return 0
+        if command == "fast":
+            print(cmd_thinking(state, "fast"))
+            return 0
+        if command == "balanced":
+            print(cmd_thinking(state, "medium"))
+            return 0
+        if command == "deep":
+            print(cmd_thinking(state, "xhigh"))
+            return 0
+        if command in {"commands", "guide", "help"}:
+            print(cmd_commands())
+            return 0
+        print(f"알 수 없는 명령입니다: {command}", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

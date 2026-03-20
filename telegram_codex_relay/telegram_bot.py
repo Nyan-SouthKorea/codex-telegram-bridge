@@ -1,0 +1,932 @@
+#!/usr/bin/env python3
+import json
+import os
+import signal
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+TELEGRAM_MAX_CHARS = 3500
+CONTROL_BRIDGE_TIMEOUT_MS = 25_000
+PROMPT_BRIDGE_TIMEOUT_MS = 210_000
+BUTTON_PREFIX = "tgbtn:"
+SESSION_BROWSER_PAGE_SIZE = 6
+RELAY_DIR = Path(__file__).resolve().parent
+REPO_ROOT = RELAY_DIR.parent
+DEFAULT_CONFIG_PATH = RELAY_DIR / "config.json"
+DEFAULT_BRIDGE_PATH = RELAY_DIR / "bin" / "codex-bridge"
+DEFAULT_STATE_DIR = RELAY_DIR / "state"
+DEFAULT_STATE_PATH = DEFAULT_STATE_DIR / "codex_bridge_state.json"
+DEFAULT_RUNTIME_STATE_PATH = DEFAULT_STATE_DIR / "runtime_state.json"
+
+
+@dataclass
+class BotConfig:
+    bot_token: str
+    allowed_chat_id: str
+    workdir: str
+    bridge_path: str
+    state_path: str
+    runtime_state_path: str
+    poll_timeout_seconds: int = 30
+
+
+@dataclass
+class RunningPrompt:
+    job_id: str
+    process: subprocess.Popen[str]
+    started_at: float
+    prompt_preview: str
+    cancel_requested: bool = False
+
+
+class TelegramError(RuntimeError):
+    pass
+
+
+def load_json(path: str) -> dict[str, Any]:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def config_path_from_env() -> Path:
+    raw = os.environ.get("CODEX_TELEGRAM_BRIDGE_CONFIG", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return DEFAULT_CONFIG_PATH
+
+
+def load_config() -> BotConfig:
+    config_path = config_path_from_env()
+    if not config_path.exists():
+        raise RuntimeError(
+            "설정 파일을 찾지 못했습니다.\n"
+            f"- expected: {config_path}\n"
+            "- `telegram_codex_relay/config.example.json`을 복사해 `config.json`으로 만든 뒤 값을 채우세요."
+        )
+    data = load_json(str(config_path))
+    bot_token = str(data["bot_token"]).strip()
+    allowed_chat_id = str(data["allowed_chat_id"]).strip()
+    if not bot_token:
+        raise RuntimeError("`bot_token` 값이 비어 있습니다.")
+    if not allowed_chat_id:
+        raise RuntimeError("`allowed_chat_id` 값이 비어 있습니다.")
+    workdir = str(data.get("workdir") or REPO_ROOT).strip()
+    bridge_path = str(data.get("bridge_path") or DEFAULT_BRIDGE_PATH).strip()
+    state_path = str(data.get("state_path") or DEFAULT_STATE_PATH).strip()
+    runtime_state_path = str(data.get("runtime_state_path") or DEFAULT_RUNTIME_STATE_PATH).strip()
+    return BotConfig(
+        bot_token=bot_token,
+        allowed_chat_id=allowed_chat_id,
+        workdir=workdir,
+        bridge_path=bridge_path,
+        state_path=state_path,
+        runtime_state_path=runtime_state_path,
+        poll_timeout_seconds=int(data.get("poll_timeout_seconds", 30)),
+    )
+
+
+def normalize_text(value: str) -> str:
+    return value.replace("\r\n", "\n").strip()
+
+
+def split_chunks(text: str) -> list[str]:
+    normalized = text.strip() or "(empty reply)"
+    if len(normalized) <= TELEGRAM_MAX_CHARS:
+        return [normalized]
+    chunks: list[str] = []
+    rest = normalized
+    while len(rest) > TELEGRAM_MAX_CHARS:
+        cut = rest.rfind("\n", 0, TELEGRAM_MAX_CHARS)
+        if cut < TELEGRAM_MAX_CHARS // 2:
+            cut = TELEGRAM_MAX_CHARS
+        chunks.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    if rest:
+        chunks.append(rest)
+    return chunks
+
+
+def parse_command(text: str) -> tuple[str, str] | None:
+    trimmed = text.strip()
+    if not trimmed.startswith("/"):
+        return None
+    body = trimmed[1:].strip()
+    if not body:
+        return None
+    if " " in body:
+        raw_name, args = body.split(" ", 1)
+    else:
+        raw_name, args = body, ""
+    name = raw_name.split("@", 1)[0].lower()
+    return name, args.strip()
+
+
+def button_data(action: str, value: str | None = None) -> str:
+    if value:
+        return f"{BUTTON_PREFIX}{action}:{value}"
+    return f"{BUTTON_PREFIX}{action}"
+
+
+def format_state_value(value: str | None, default_label: str = "(default)") -> str:
+    text = str(value or "").strip()
+    return text or default_label
+
+
+def truncate_button_label(value: str, max_chars: int = 28) -> str:
+    text = value.strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 1].rstrip()}…"
+
+
+def label_with_check(active: bool, label: str) -> str:
+    return f"✓ {label}" if active else label
+
+
+def format_path_label(path_value: str | Path) -> str:
+    path = Path(path_value).expanduser()
+    home = Path.home()
+    try:
+        relative = path.relative_to(home)
+        return "~" if str(relative) == "." else f"~/{relative}"
+    except Exception:
+        return str(path)
+
+
+def parse_button_action(value: str) -> tuple[str, str | None] | None:
+    text = value.strip()
+    if not text.startswith(BUTTON_PREFIX):
+        return None
+    body = text[len(BUTTON_PREFIX) :].strip()
+    if not body:
+        return None
+    parts = body.split(":")
+    action = parts[0].lower()
+    arg = ":".join(parts[1:]).strip() if len(parts) > 1 else None
+    return action, arg or None
+
+
+class TelegramApi:
+    def __init__(self, token: str):
+        self.token = token
+
+    def request(self, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        url = f"https://api.telegram.org/bot{self.token}/{method}"
+        data = None
+        headers = {"content-type": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+        req = Request(url, method="POST", headers=headers, data=data)
+        try:
+            with urlopen(req, timeout=60) as response:
+                body = response.read().decode("utf-8")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise TelegramError(f"Telegram HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise TelegramError(f"Telegram network error: {exc}") from exc
+        parsed = json.loads(body)
+        if not parsed.get("ok"):
+            raise TelegramError(f"Telegram API error: {body}")
+        return parsed
+
+    def delete_webhook(self) -> None:
+        self.request("deleteWebhook", {"drop_pending_updates": False})
+
+    def get_updates(self, offset: int | None, timeout: int) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
+        if offset is not None:
+            payload["offset"] = offset
+        return self.request("getUpdates", payload).get("result", [])
+
+    def send_message(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        inline_keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> None:
+        chunks = split_chunks(text)
+        for index, chunk in enumerate(chunks):
+            payload: dict[str, Any] = {
+                "chat_id": chat_id,
+                "text": chunk,
+                "disable_web_page_preview": True,
+            }
+            if index == 0 and reply_to_message_id:
+                payload["reply_parameters"] = {"message_id": reply_to_message_id}
+            if index == len(chunks) - 1 and inline_keyboard:
+                payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
+            self.request("sendMessage", payload)
+
+    def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
+        payload: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        self.request("answerCallbackQuery", payload)
+
+
+class DirectTelegramCodexBot:
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self.api = TelegramApi(config.bot_token)
+        self.running_lock = threading.Lock()
+        self.running_prompt: RunningPrompt | None = None
+        self.write_runtime_state(status="idle")
+
+    def load_bridge_state(self) -> dict[str, Any]:
+        try:
+            return load_json(self.config.state_path)
+        except Exception:
+            return {}
+
+    def write_runtime_state(self, **updates: Any) -> None:
+        path = Path(self.config.runtime_state_path)
+        data: dict[str, Any]
+        try:
+            data = load_json(str(path))
+        except Exception:
+            data = {"status": "idle"}
+        data.update(updates)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def load_runtime_state(self) -> dict[str, Any]:
+        try:
+            return load_json(self.config.runtime_state_path)
+        except Exception:
+            return {"status": "idle"}
+
+    def session_browser_root(self) -> Path:
+        return Path.home()
+
+    def session_browser_state(self) -> tuple[Path, int, str]:
+        data = self.load_runtime_state()
+        raw_path = str(data.get("session_browser_path") or self.session_browser_root())
+        try:
+            path = Path(raw_path).expanduser().resolve()
+        except Exception:
+            path = self.session_browser_root()
+        if not path.exists() or not path.is_dir():
+            path = self.session_browser_root()
+        try:
+            page = max(int(data.get("session_browser_page") or 0), 0)
+        except Exception:
+            page = 0
+        token = str(data.get("session_browser_token") or "")
+        return path, page, token
+
+    def set_session_browser_state(self, path: Path, page: int = 0) -> str:
+        normalized = path.expanduser().resolve()
+        token = str(int(time.time() * 1000))
+        self.write_runtime_state(
+            session_browser_path=str(normalized),
+            session_browser_page=max(page, 0),
+            session_browser_token=token,
+        )
+        return token
+
+    def list_browser_directories(self, path: Path) -> list[Path]:
+        try:
+            entries = [entry for entry in path.iterdir() if entry.is_dir()]
+        except Exception:
+            return []
+        return sorted(entries, key=lambda entry: (entry.name.startswith("."), entry.name.lower()))
+
+    def session_button_label(self, entry: dict[str, Any], active: bool) -> str:
+        cwd = format_path_label(str(entry.get("cwd") or ""))
+        label = truncate_button_label(cwd, max_chars=26)
+        return label_with_check(active, label)
+
+    def current_runtime_status(self) -> tuple[str, RunningPrompt | None]:
+        with self.running_lock:
+            prompt = self.running_prompt
+            if prompt and prompt.process.poll() is None:
+                return "busy", prompt
+            if prompt and prompt.process.poll() is not None:
+                self.running_prompt = None
+            return "idle", None
+
+    def run_bridge(self, args: list[str], stdin_text: str | None = None, timeout_ms: int = CONTROL_BRIDGE_TIMEOUT_MS) -> str:
+        result = subprocess.run(
+            [self.config.bridge_path, *args],
+            input=stdin_text,
+            cwd=self.config.workdir,
+            env=self.bridge_env(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout_ms / 1000,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or "bridge failed").strip())
+        return result.stdout.strip()
+
+    def build_help_menu(self) -> tuple[str, list[list[dict[str, str]]]]:
+        state = self.load_bridge_state()
+        text = "\n".join(
+            [
+                "Codex 텔레그램 사용법",
+                "- 평문은 현재 Codex 세션으로 바로 전달됩니다.",
+                "- 설정 변경은 버튼으로만 합니다.",
+                "- 권한이 full이면 지속 세션, read/deny면 격리 1회 실행입니다.",
+                "",
+                f"현재 모델: {format_state_value(state.get('model'))}",
+                f"현재 thinking: {format_state_value(state.get('reasoning_effort'))}",
+                f"현재 권한: {format_state_value(state.get('permission'), 'full')}",
+                f"현재 세션: {format_state_value(state.get('active_session_name'), '(none)')}",
+            ]
+        )
+        buttons = [
+            [
+                {"text": "세션", "callback_data": button_data("menu", "resume")},
+                {"text": "모델", "callback_data": button_data("menu", "model")},
+            ],
+            [
+                {"text": "Thinking", "callback_data": button_data("menu", "thinking")},
+                {"text": "권한", "callback_data": button_data("menu", "permission")},
+            ],
+            [
+                {"text": "최근 출력", "callback_data": button_data("read")},
+                {"text": "현재 상태", "callback_data": button_data("status")},
+            ],
+            [{"text": "취소", "callback_data": button_data("cancel")}],
+        ]
+        return text, buttons
+
+    def build_resume_menu(self) -> tuple[str, list[list[dict[str, str]]]]:
+        state = self.load_bridge_state()
+        raw = self.run_bridge(["sessions-json", "8"])
+        entries = json.loads(raw)
+        rows: list[list[dict[str, str]]] = []
+        active_id = str(state.get("active_session_id") or "").strip()
+        current_cwd = format_path_label(str(state.get("workdir") or ""))
+        text_lines = [
+            "Codex 세션",
+            f"현재 세션: {format_state_value(state.get('active_session_name'), '(none)')}",
+            f"현재 작업 폴더: {current_cwd}",
+            "",
+            "최근 세션:",
+        ]
+        rows.append(
+            [
+                {"text": "새 세션 만들기", "callback_data": button_data("menu", "session-browser")},
+                {"text": "현재 세션 삭제", "callback_data": button_data("session", "delete")},
+            ]
+        )
+        if not entries:
+            text_lines.append("- 사용 가능한 세션이 없습니다.")
+        for entry in entries:
+            active = bool(entry.get("active")) or str(entry.get("id") or "") == active_id
+            cwd_label = format_path_label(str(entry.get("cwd") or ""))
+            title = str(entry.get("name") or entry.get("id") or "").strip()
+            text_lines.append(f"- {cwd_label} | {truncate_button_label(title, max_chars=60)}")
+            rows.append(
+                [
+                    {
+                        "text": self.session_button_label(entry, active),
+                        "callback_data": button_data("resume", str(entry.get("id"))),
+                    }
+                ]
+            )
+        rows.append(
+            [
+                {"text": "도움말", "callback_data": button_data("menu", "help")},
+                {"text": "현재 상태", "callback_data": button_data("status")},
+            ]
+        )
+        return "\n".join(text_lines), rows
+
+    def build_session_browser_menu(self) -> tuple[str, list[list[dict[str, str]]]]:
+        path, page, _ = self.session_browser_state()
+        directories = self.list_browser_directories(path)
+        page_count = max((len(directories) - 1) // SESSION_BROWSER_PAGE_SIZE + 1, 1)
+        page = min(page, page_count - 1)
+        token = self.set_session_browser_state(path, page)
+        start = page * SESSION_BROWSER_PAGE_SIZE
+        visible = directories[start : start + SESSION_BROWSER_PAGE_SIZE]
+        text_lines = [
+            "새 Codex 세션 만들기",
+            f"현재 폴더: {format_path_label(path)}",
+            f"페이지: {page + 1}/{page_count}",
+            "",
+            "폴더를 눌러 안으로 들어가고, 원하는 위치에서 생성 버튼을 누르세요.",
+        ]
+        rows: list[list[dict[str, str]]] = []
+        for index, entry in enumerate(visible):
+            rows.append(
+                [
+                    {
+                        "text": truncate_button_label(entry.name or str(entry), max_chars=28),
+                        "callback_data": button_data("sessbrowse", f"open|{token}|{index}"),
+                    }
+                ]
+            )
+        if not visible:
+            text_lines.append("")
+            text_lines.append("- 하위 폴더가 없습니다.")
+        nav_row: list[dict[str, str]] = []
+        if path.parent != path:
+            nav_row.append({"text": "상위", "callback_data": button_data("sessbrowse", f"up|{token}")})
+        if page > 0:
+            nav_row.append({"text": "이전", "callback_data": button_data("sessbrowse", f"page|{token}|{page - 1}")})
+        if page + 1 < page_count:
+            nav_row.append({"text": "다음", "callback_data": button_data("sessbrowse", f"page|{token}|{page + 1}")})
+        if nav_row:
+            rows.append(nav_row)
+        rows.append(
+            [
+                {"text": "이 폴더로 세션 생성", "callback_data": button_data("sessbrowse", f"create|{token}")},
+                {"text": "세션 메뉴", "callback_data": button_data("menu", "resume")},
+            ]
+        )
+        rows.append(
+            [
+                {"text": "도움말", "callback_data": button_data("menu", "help")},
+                {"text": "현재 상태", "callback_data": button_data("status")},
+            ]
+        )
+        return "\n".join(text_lines), rows
+
+    def build_model_menu(self) -> tuple[str, list[list[dict[str, str]]]]:
+        state = self.load_bridge_state()
+        current_model = str(state.get("model") or "").strip()
+        text = "\n".join(
+            [
+                "Codex 모델 선택",
+                f"현재 모델: {format_state_value(state.get('model'))}",
+                "",
+                "모델을 누르면 바로 저장하고, 다음 메시지에서 thinking 버튼을 이어서 띄웁니다.",
+            ]
+        )
+        buttons = [
+            [
+                {"text": label_with_check(current_model == "gpt-5.4", "GPT-5.4"), "callback_data": button_data("model", "gpt-5.4")},
+                {"text": label_with_check(current_model == "gpt-5.4-mini", "5.4 Mini"), "callback_data": button_data("model", "gpt-5.4-mini")},
+            ],
+            [
+                {"text": label_with_check(current_model == "gpt-5.3-codex", "5.3 Codex"), "callback_data": button_data("model", "gpt-5.3-codex")},
+                {"text": label_with_check(current_model == "gpt-5.3-codex-spark", "5.3 Spark"), "callback_data": button_data("model", "gpt-5.3-codex-spark")},
+            ],
+            [
+                {"text": label_with_check(current_model == "gpt-5.2", "5.2"), "callback_data": button_data("model", "gpt-5.2")},
+                {"text": label_with_check(current_model == "gpt-5.2-codex", "5.2 Codex"), "callback_data": button_data("model", "gpt-5.2-codex")},
+            ],
+            [
+                {"text": label_with_check(current_model == "gpt-5.1-codex-max", "5.1 Max"), "callback_data": button_data("model", "gpt-5.1-codex-max")},
+                {"text": label_with_check(current_model == "gpt-5.1-codex-mini", "5.1 Mini"), "callback_data": button_data("model", "gpt-5.1-codex-mini")},
+            ],
+            [
+                {"text": label_with_check(not current_model, "기본값"), "callback_data": button_data("model", "default")},
+                {"text": "도움말", "callback_data": button_data("menu", "help")},
+            ],
+        ]
+        return text, buttons
+
+    def build_thinking_menu(self) -> tuple[str, list[list[dict[str, str]]]]:
+        state = self.load_bridge_state()
+        current = str(state.get("reasoning_effort") or "").strip()
+        text = "\n".join(
+            [
+                "Codex thinking 선택",
+                f"현재 thinking: {format_state_value(state.get('reasoning_effort'))}",
+                "",
+                "일반 작업은 fast/medium, 깊게 검토할 때는 high/xhigh가 적당합니다.",
+            ]
+        )
+        buttons = [
+            [
+                {"text": label_with_check(current == "low", "Fast"), "callback_data": button_data("thinking", "fast")},
+                {"text": label_with_check(current == "medium", "Medium"), "callback_data": button_data("thinking", "medium")},
+            ],
+            [
+                {"text": label_with_check(current == "high", "High"), "callback_data": button_data("thinking", "high")},
+                {"text": label_with_check(current == "xhigh", "XHigh"), "callback_data": button_data("thinking", "xhigh")},
+            ],
+            [
+                {"text": label_with_check(not current, "기본값"), "callback_data": button_data("thinking", "default")},
+                {"text": "도움말", "callback_data": button_data("menu", "help")},
+            ],
+        ]
+        return text, buttons
+
+    def build_permission_menu(self) -> tuple[str, list[list[dict[str, str]]]]:
+        state = self.load_bridge_state()
+        current = str(state.get("permission") or "full").strip() or "full"
+        text = "\n".join(
+            [
+                "Codex 권한 선택",
+                f"현재 권한: {format_state_value(state.get('permission'), 'full')}",
+                "",
+                "full은 지속 세션 + 전체 허용, read/deny는 격리 1회 실행입니다.",
+            ]
+        )
+        buttons = [
+            [
+                {"text": label_with_check(current == "full", "Full"), "callback_data": button_data("permission", "full")},
+                {"text": label_with_check(current == "read", "Read"), "callback_data": button_data("permission", "read")},
+            ],
+            [
+                {"text": label_with_check(current == "deny", "Deny"), "callback_data": button_data("permission", "deny")},
+                {"text": "도움말", "callback_data": button_data("menu", "help")},
+            ],
+        ]
+        return text, buttons
+
+    def build_menu(self, kind: str) -> tuple[str, list[list[dict[str, str]]]]:
+        if kind == "help":
+            return self.build_help_menu()
+        if kind == "resume":
+            return self.build_resume_menu()
+        if kind == "session-browser":
+            return self.build_session_browser_menu()
+        if kind == "model":
+            return self.build_model_menu()
+        if kind == "thinking":
+            return self.build_thinking_menu()
+        return self.build_permission_menu()
+
+    def prompt_busy_message(self) -> str:
+        _, running = self.current_runtime_status()
+        if not running:
+            return "현재 실행 중인 작업이 없습니다."
+        seconds = int(time.time() - running.started_at)
+        return (
+            "이미 Codex 작업이 실행 중입니다.\n"
+            f"- started: {seconds}s ago\n"
+            f"- preview: {running.prompt_preview}\n"
+            "- 필요하면 /cancel 후 다시 시도하세요."
+        )
+
+    def cancel_running_prompt(self) -> str:
+        with self.running_lock:
+            running = self.running_prompt
+            if not running or running.process.poll() is not None:
+                self.running_prompt = None
+                self.write_runtime_state(status="idle", current_job_id=None, pid=None, prompt_preview=None)
+                return "현재 취소할 Codex 실행이 없습니다."
+            running.cancel_requested = True
+            try:
+                os.killpg(running.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            self.write_runtime_state(
+                status="cancel-requested",
+                current_job_id=running.job_id,
+                pid=running.process.pid,
+                prompt_preview=running.prompt_preview,
+                cancel_requested=True,
+            )
+            return f"현재 Codex 실행 취소를 요청했습니다.\n- job: {running.job_id}"
+
+    def start_prompt(self, chat_id: str, prompt_text: str, reply_to_message_id: int | None) -> str | None:
+        status, _ = self.current_runtime_status()
+        if status == "busy":
+            return self.prompt_busy_message()
+        command = [self.config.bridge_path, "prompt"]
+        proc = subprocess.Popen(
+            command,
+            cwd=self.config.workdir,
+            env=self.bridge_env(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            start_new_session=True,
+        )
+        job_id = f"job-{int(time.time() * 1000)}"
+        running = RunningPrompt(
+            job_id=job_id,
+            process=proc,
+            started_at=time.time(),
+            prompt_preview=truncate_button_label(prompt_text, max_chars=40),
+        )
+        with self.running_lock:
+            self.running_prompt = running
+        self.write_runtime_state(
+            status="busy",
+            current_job_id=job_id,
+            pid=proc.pid,
+            prompt_preview=running.prompt_preview,
+            started_at=running.started_at,
+            cancel_requested=False,
+        )
+        worker = threading.Thread(
+            target=self._wait_prompt,
+            args=(chat_id, reply_to_message_id, running, prompt_text.strip()),
+            daemon=True,
+        )
+        worker.start()
+        return None
+
+    def bridge_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        env["CODEX_TELEGRAM_BRIDGE_STATE_PATH"] = self.config.state_path
+        env["CODEX_TELEGRAM_BRIDGE_DEFAULT_WORKDIR"] = self.config.workdir
+        return env
+
+    def _wait_prompt(
+        self,
+        chat_id: str,
+        reply_to_message_id: int | None,
+        running: RunningPrompt,
+        prompt_text: str,
+    ) -> None:
+        stdout_text = ""
+        stderr_text = ""
+        try:
+            stdout_text, stderr_text = running.process.communicate(
+                input=prompt_text + "\n",
+                timeout=PROMPT_BRIDGE_TIMEOUT_MS / 1000,
+            )
+            code = running.process.returncode
+            if code == 0:
+                message = stdout_text.strip() or "(empty reply)"
+                self.api.send_message(chat_id, message, reply_to_message_id=reply_to_message_id)
+                self.write_runtime_state(
+                    status="idle",
+                    current_job_id=None,
+                    pid=None,
+                    prompt_preview=None,
+                    last_completed_at=time.time(),
+                    last_error=None,
+                )
+            else:
+                if running.cancel_requested:
+                    self.write_runtime_state(
+                        status="idle",
+                        current_job_id=None,
+                        pid=None,
+                        prompt_preview=None,
+                        last_completed_at=time.time(),
+                        last_error=None,
+                    )
+                else:
+                    error = (stderr_text or stdout_text or f"bridge failed ({code})").strip()
+                    self.api.send_message(chat_id, f"처리 중 오류가 났습니다.\n{error}", reply_to_message_id=reply_to_message_id)
+                    self.write_runtime_state(
+                        status="idle",
+                        current_job_id=None,
+                        pid=None,
+                        prompt_preview=None,
+                        last_completed_at=time.time(),
+                        last_error=error,
+                    )
+        except Exception as exc:
+            self.api.send_message(chat_id, f"처리 중 오류가 났습니다.\n{exc}", reply_to_message_id=reply_to_message_id)
+            self.write_runtime_state(
+                status="idle",
+                current_job_id=None,
+                pid=None,
+                prompt_preview=None,
+                last_completed_at=time.time(),
+                last_error=str(exc),
+            )
+        finally:
+            with self.running_lock:
+                if self.running_prompt and self.running_prompt.job_id == running.job_id:
+                    self.running_prompt = None
+
+    def append_runtime_status(self, text: str) -> str:
+        status, running = self.current_runtime_status()
+        if status != "busy" or not running:
+            return text
+        seconds = int(time.time() - running.started_at)
+        extra = "\n".join(
+            [
+                "",
+                "Runtime:",
+                "- status: busy",
+                f"- currentJobId: {running.job_id}",
+                f"- runningForSeconds: {seconds}",
+                f"- promptPreview: {running.prompt_preview}",
+            ]
+        )
+        return f"{text}\n{extra}".strip()
+
+    def send_menu(self, chat_id: str, menu: str, reply_to_message_id: int | None = None, notice: str | None = None) -> None:
+        text, buttons = self.build_menu(menu)
+        if notice:
+            text = f"{notice}\n\n{text}"
+        self.api.send_message(chat_id, text, reply_to_message_id=reply_to_message_id, inline_keyboard=buttons)
+
+    def handle_message(self, message: dict[str, Any]) -> None:
+        chat_id = str(message.get("chat", {}).get("id", "")).strip()
+        if chat_id != self.config.allowed_chat_id:
+            return
+        text = normalize_text(str(message.get("text") or ""))
+        if not text:
+            return
+        message_id = int(message.get("message_id"))
+        command = parse_command(text)
+        if not command:
+            busy_error = self.start_prompt(chat_id, text, message_id)
+            if busy_error:
+                self.api.send_message(chat_id, busy_error, reply_to_message_id=message_id)
+                return
+            self.api.send_message(chat_id, "Codex에 전달했습니다. 처리 중입니다.", reply_to_message_id=message_id)
+            return
+
+        name, args = command
+        if name == "help":
+            self.send_menu(chat_id, "help", reply_to_message_id=message_id)
+            return
+        if name == "resume":
+            notice = "세션 전환은 이제 버튼으로만 선택합니다." if args else None
+            self.send_menu(chat_id, "resume", reply_to_message_id=message_id, notice=notice)
+            return
+        if name == "model":
+            notice = "모델 변경은 이제 버튼으로만 선택합니다." if args else None
+            self.send_menu(chat_id, "model", reply_to_message_id=message_id, notice=notice)
+            return
+        if name == "thinking":
+            notice = "thinking 변경은 이제 버튼으로만 선택합니다." if args else None
+            self.send_menu(chat_id, "thinking", reply_to_message_id=message_id, notice=notice)
+            return
+        if name in {"fast", "balanced", "deep"}:
+            self.send_menu(chat_id, "thinking", reply_to_message_id=message_id, notice="thinking 변경은 Thinking 버튼 메뉴에서 선택합니다.")
+            return
+        if name == "permission":
+            notice = "권한 변경은 이제 버튼으로만 선택합니다." if args else None
+            self.send_menu(chat_id, "permission", reply_to_message_id=message_id, notice=notice)
+            return
+        if name == "status":
+            output = self.run_bridge(["status"])
+            self.api.send_message(chat_id, self.append_runtime_status(output), reply_to_message_id=message_id)
+            return
+        if name == "read":
+            output = self.run_bridge(["read"])
+            self.api.send_message(chat_id, output, reply_to_message_id=message_id)
+            return
+        if name == "cancel":
+            output = self.cancel_running_prompt()
+            self.api.send_message(chat_id, output, reply_to_message_id=message_id)
+            return
+        self.send_menu(chat_id, "help", reply_to_message_id=message_id, notice=f"지원하지 않는 명령입니다: /{name}")
+
+    def handle_callback(self, callback_query: dict[str, Any]) -> None:
+        callback_id = str(callback_query.get("id") or "")
+        data = normalize_text(str(callback_query.get("data") or ""))
+        message = callback_query.get("message") or {}
+        chat_id = str(message.get("chat", {}).get("id", "")).strip()
+        if chat_id != self.config.allowed_chat_id:
+            self.api.answer_callback_query(callback_id)
+            return
+        action = parse_button_action(data)
+        if not action:
+            self.api.answer_callback_query(callback_id, "알 수 없는 버튼입니다.")
+            return
+        kind, value = action
+        try:
+            if kind == "menu":
+                self.send_menu(chat_id, value or "help")
+                self.api.answer_callback_query(callback_id)
+                return
+            if kind == "read":
+                output = self.run_bridge(["read"])
+                self.api.send_message(chat_id, output)
+                self.api.answer_callback_query(callback_id)
+                return
+            if kind == "status":
+                output = self.run_bridge(["status"])
+                self.api.send_message(chat_id, self.append_runtime_status(output))
+                self.api.answer_callback_query(callback_id)
+                return
+            if kind == "cancel":
+                output = self.cancel_running_prompt()
+                self.api.send_message(chat_id, output)
+                self.api.answer_callback_query(callback_id)
+                return
+            if kind == "resume" and value:
+                if self.current_runtime_status()[0] == "busy":
+                    self.api.answer_callback_query(callback_id, "작업 중에는 세션 전환을 잠시 막습니다.")
+                    return
+                output = self.run_bridge(["resume", value])
+                self.api.send_message(chat_id, output)
+                self.send_menu(chat_id, "resume")
+                self.api.answer_callback_query(callback_id, "세션 전환 완료")
+                return
+            if kind == "session" and value == "delete":
+                if self.current_runtime_status()[0] == "busy":
+                    self.api.answer_callback_query(callback_id, "작업 중에는 현재 세션을 삭제할 수 없습니다.")
+                    return
+                output = self.run_bridge(["delete-session"])
+                self.api.send_message(chat_id, output)
+                self.send_menu(chat_id, "resume")
+                self.api.answer_callback_query(callback_id, "현재 세션 삭제 완료")
+                return
+            if kind == "sessbrowse" and value:
+                parts = value.split("|")
+                subaction = parts[0] if parts else ""
+                runtime = self.load_runtime_state()
+                current_token = str(runtime.get("session_browser_token") or "")
+                current_path, current_page, _ = self.session_browser_state()
+                if subaction == "start":
+                    self.send_menu(chat_id, "session-browser")
+                    self.api.answer_callback_query(callback_id)
+                    return
+                if len(parts) < 2 or parts[1] != current_token:
+                    self.send_menu(chat_id, "session-browser", notice="세션 브라우저가 갱신되었습니다. 다시 선택하세요.")
+                    self.api.answer_callback_query(callback_id, "브라우저를 새로고침했습니다.")
+                    return
+                if subaction == "up":
+                    self.set_session_browser_state(current_path.parent if current_path.parent != current_path else current_path, 0)
+                    self.send_menu(chat_id, "session-browser")
+                    self.api.answer_callback_query(callback_id)
+                    return
+                if subaction == "page" and len(parts) >= 3:
+                    try:
+                        target_page = max(int(parts[2]), 0)
+                    except ValueError:
+                        target_page = 0
+                    self.set_session_browser_state(current_path, target_page)
+                    self.send_menu(chat_id, "session-browser")
+                    self.api.answer_callback_query(callback_id)
+                    return
+                if subaction == "open" and len(parts) >= 3:
+                    try:
+                        index = int(parts[2])
+                    except ValueError:
+                        index = -1
+                    directories = self.list_browser_directories(current_path)
+                    start = current_page * SESSION_BROWSER_PAGE_SIZE
+                    visible = directories[start : start + SESSION_BROWSER_PAGE_SIZE]
+                    if not (0 <= index < len(visible)):
+                        self.send_menu(chat_id, "session-browser", notice="선택한 폴더를 다시 골라주세요.")
+                        self.api.answer_callback_query(callback_id, "폴더 목록이 바뀌었습니다.")
+                        return
+                    self.set_session_browser_state(visible[index], 0)
+                    self.send_menu(chat_id, "session-browser")
+                    self.api.answer_callback_query(callback_id)
+                    return
+                if subaction == "create":
+                    if self.current_runtime_status()[0] == "busy":
+                        self.api.answer_callback_query(callback_id, "작업 중에는 새 세션을 만들 수 없습니다.")
+                        return
+                    output = self.run_bridge(["new-session", str(current_path)], timeout_ms=120_000)
+                    self.api.send_message(chat_id, output)
+                    self.send_menu(chat_id, "resume")
+                    self.api.answer_callback_query(callback_id, "새 세션 생성 완료")
+                    return
+                self.api.answer_callback_query(callback_id, "지원하지 않는 세션 버튼입니다.")
+                return
+            if kind == "model" and value:
+                output = self.run_bridge(["model", value])
+                self.api.send_message(chat_id, output)
+                self.send_menu(chat_id, "thinking")
+                self.api.answer_callback_query(callback_id, "모델 변경 완료")
+                return
+            if kind == "thinking" and value:
+                output = self.run_bridge(["thinking", value])
+                self.api.send_message(chat_id, output)
+                self.api.answer_callback_query(callback_id, "thinking 변경 완료")
+                return
+            if kind == "permission" and value:
+                output = self.run_bridge(["permission", value])
+                self.api.send_message(chat_id, output)
+                self.api.answer_callback_query(callback_id, "권한 변경 완료")
+                return
+            self.api.answer_callback_query(callback_id, "지원하지 않는 버튼입니다.")
+        except Exception as exc:
+            self.api.answer_callback_query(callback_id, "오류")
+            self.api.send_message(chat_id, f"처리 중 오류가 났습니다.\n{exc}")
+
+    def process_update(self, update: dict[str, Any]) -> None:
+        if "message" in update:
+            self.handle_message(update["message"])
+        elif "callback_query" in update:
+            self.handle_callback(update["callback_query"])
+
+    def run_forever(self) -> None:
+        self.api.delete_webhook()
+        offset: int | None = None
+        while True:
+            try:
+                updates = self.api.get_updates(offset=offset, timeout=self.config.poll_timeout_seconds)
+                for update in updates:
+                    offset = int(update["update_id"]) + 1
+                    self.process_update(update)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                self.write_runtime_state(last_error=str(exc), last_error_at=time.time())
+                time.sleep(2)
+
+
+def main() -> int:
+    config = load_config()
+    bot = DirectTelegramCodexBot(config)
+    bot.run_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
