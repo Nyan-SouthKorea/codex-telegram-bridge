@@ -75,7 +75,7 @@ systemctl --user status codex-telegram-bridge.service
 Telegram에서 순서대로:
 
 1. `/help`
-2. `Fast`
+2. `Low (Fast)`
 3. `현재 상태`
 4. `세션`
 5. `새 세션 만들기`
@@ -83,7 +83,7 @@ Telegram에서 순서대로:
 7. `모델`
 8. `GPT-5.4`
 9. `Thinking`
-10. `Fast`
+10. `Low (Fast)`
 11. `권한`
 12. `Full`
 13. 평문으로 `pwd만 한 줄로 답해`

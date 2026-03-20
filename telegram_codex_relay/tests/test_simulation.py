@@ -114,6 +114,9 @@ class SimulatedBot(DirectTelegramCodexBot):
         if args[:2] == ["model", "gpt-5.4-mini"]:
             self.fake_state["model"] = "gpt-5.4-mini"
             return "Codex 모델 오버라이드를 저장했습니다: gpt-5.4-mini"
+        if args[:2] == ["thinking", "fast"]:
+            self.fake_state["reasoning_effort"] = "low"
+            return "Codex thinking 오버라이드를 저장했습니다: low\n- Fast는 `model_reasoning_effort=low` 별칭입니다."
         if args[:2] == ["thinking", "xhigh"]:
             self.fake_state["reasoning_effort"] = "xhigh"
             return "Codex thinking 오버라이드를 저장했습니다: xhigh"
@@ -161,7 +164,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertIn("Codex 텔레그램 사용법", sent["text"])
         self.assertEqual(sent["reply_to_message_id"], 10)
         self.assertEqual(sent["inline_keyboard"][0][0]["text"], "세션")
-        self.assertEqual(sent["inline_keyboard"][1][0]["text"], "Fast")
+        self.assertEqual(sent["inline_keyboard"][1][0]["text"], "Low (Fast)")
 
     def test_resume_menu_includes_create_and_delete_buttons(self):
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 11, "text": "/resume"})
@@ -201,6 +204,22 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         sent = self.bot.api.sent[-1]
         self.assertIn("thinking 변경은 Thinking 버튼 메뉴에서 선택합니다.", sent["text"])
         self.assertIn("Codex thinking 선택", sent["text"])
+        self.assertIn("Fast는 `model_reasoning_effort=low`를 저장하는 별칭입니다.", sent["text"])
+
+    def test_fast_callback_reports_saved_low_state(self):
+        self.bot.handle_callback(
+            {
+                "id": "cb-fast",
+                "data": "tgbtn:thinking:fast",
+                "message": {"chat": {"id": 111111111}},
+            }
+        )
+        sent = self.bot.api.sent[-1]
+        self.assertEqual(self.bot.bridge_calls[0]["args"], ["thinking", "fast"])
+        self.assertIn("Codex thinking 오버라이드를 저장했습니다: low", sent["text"])
+        self.assertIn("현재 저장값: low (Fast)", sent["text"])
+        self.assertIn("토큰 생성 속도 2배를 보장하지 않습니다.", sent["text"])
+        self.assertEqual(self.bot.api.answered[-1]["text"], "thinking 저장: low (Fast)")
 
     def test_plain_text_starts_prompt_and_sends_processing_notice(self):
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 77, "text": "파일 하나 만들어줘"})
@@ -359,6 +378,15 @@ class CodexBridgeUnitTests(unittest.TestCase):
 
         self.assertIn("Active Session", output)
         self.assertIn("active output", output)
+
+    def test_cmd_thinking_fast_is_explicit_low_alias(self):
+        state = {"reasoning_effort": "xhigh"}
+
+        output = bridge.cmd_thinking(state, "fast")
+
+        self.assertEqual(state["reasoning_effort"], "low")
+        self.assertIn("저장했습니다: low", output)
+        self.assertIn("Fast는 `model_reasoning_effort=low` 별칭", output)
 
 
 if __name__ == "__main__":

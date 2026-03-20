@@ -139,6 +139,19 @@ def format_state_value(value: str | None, default_label: str = "(default)") -> s
     return text or default_label
 
 
+def format_reasoning_value(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    labels = {
+        "low": "low (Fast)",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+    }
+    if not normalized:
+        return "(default)"
+    return labels.get(normalized, normalized)
+
+
 def truncate_button_label(value: str, max_chars: int = 28) -> str:
     text = value.strip()
     if len(text) <= max_chars:
@@ -379,9 +392,10 @@ class DirectTelegramCodexBot:
                 "- 평문은 현재 Codex 세션으로 바로 전달됩니다.",
                 "- 설정 변경은 버튼으로만 합니다.",
                 "- 권한이 full이면 지속 세션, read/deny면 격리 1회 실행입니다.",
+                "- `Fast`는 속도 배수 모드가 아니라 `reasoning=low` 별칭입니다.",
                 "",
                 f"현재 모델: {format_state_value(state.get('model'))}",
-                f"현재 thinking: {format_state_value(state.get('reasoning_effort'))}",
+                f"현재 thinking: {format_reasoning_value(state.get('reasoning_effort'))}",
                 f"현재 권한: {format_state_value(state.get('permission'), 'full')}",
                 f"현재 세션: {format_state_value(state.get('active_session_name'), '(none)')}",
             ]
@@ -392,7 +406,7 @@ class DirectTelegramCodexBot:
                 {"text": "모델", "callback_data": button_data("menu", "model")},
             ],
             [
-                {"text": "Fast", "callback_data": button_data("thinking", "fast")},
+                {"text": "Low (Fast)", "callback_data": button_data("thinking", "fast")},
                 {"text": "Thinking", "callback_data": button_data("menu", "thinking")},
             ],
             [
@@ -560,14 +574,15 @@ class DirectTelegramCodexBot:
         text = "\n".join(
             [
                 "Codex thinking 선택",
-                f"현재 thinking: {format_state_value(state.get('reasoning_effort'))}",
+                f"현재 thinking: {format_reasoning_value(state.get('reasoning_effort'))}",
                 "",
-                "일반 작업은 fast/medium, 깊게 검토할 때는 high/xhigh가 적당합니다.",
+                "Fast는 `model_reasoning_effort=low`를 저장하는 별칭입니다.",
+                "속도 2배를 보장하는 모드는 아닙니다.",
             ]
         )
         buttons = [
             [
-                {"text": label_with_check(current == "low", "Fast"), "callback_data": button_data("thinking", "fast")},
+                {"text": label_with_check(current == "low", "Low (Fast)"), "callback_data": button_data("thinking", "fast")},
                 {"text": label_with_check(current == "medium", "Medium"), "callback_data": button_data("thinking", "medium")},
             ],
             [
@@ -1016,8 +1031,19 @@ class DirectTelegramCodexBot:
                 return
             if kind == "thinking" and value:
                 output = self.run_bridge(["thinking", value])
+                state = self.load_bridge_state()
+                actual = format_reasoning_value(state.get("reasoning_effort"))
+                if value == "fast":
+                    output = (
+                        f"{output}\n"
+                        f"- 현재 저장값: {actual}\n"
+                        "- Fast 버튼은 `model_reasoning_effort=low`를 저장합니다.\n"
+                        "- 토큰 생성 속도 2배를 보장하지 않습니다."
+                    )
+                else:
+                    output = f"{output}\n- 현재 저장값: {actual}"
                 self.api.send_message(chat_id, output)
-                self.api.answer_callback_query(callback_id, "thinking 변경 완료")
+                self.api.answer_callback_query(callback_id, f"thinking 저장: {actual}")
                 return
             if kind == "permission" and value:
                 output = self.run_bridge(["permission", value])

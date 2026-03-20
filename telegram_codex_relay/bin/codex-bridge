@@ -803,7 +803,7 @@ def cmd_thinking(state: dict[str, Any], value: str | None) -> str:
     if not value or value.strip().lower() in {"show", "status"}:
         return (
             f"현재 Codex thinking 오버라이드: {state.get('reasoning_effort') or '(default)'}\n"
-            "사용 예시: /thinking fast, /thinking medium, /thinking high, /thinking xhigh"
+            "사용 예시: /thinking fast(low), /thinking medium, /thinking high, /thinking xhigh"
         )
     normalized = reasoning_mode(value)
     if normalized is None and value.strip().lower() not in {"default", "reset", "off", "none", "clear"}:
@@ -812,6 +812,11 @@ def cmd_thinking(state: dict[str, Any], value: str | None) -> str:
     save_state(state)
     if normalized is None:
         return "Codex thinking 오버라이드를 기본값으로 되돌렸습니다."
+    if str(value).strip().lower() == "fast":
+        return (
+            "Codex thinking 오버라이드를 저장했습니다: low\n"
+            "- Fast는 `model_reasoning_effort=low` 별칭입니다."
+        )
     return f"Codex thinking 오버라이드를 저장했습니다: {normalized}"
 
 

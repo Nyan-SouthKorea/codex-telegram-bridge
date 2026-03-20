@@ -14,12 +14,13 @@
 - 버튼 메뉴:
   - `세션`
   - `모델`
-  - `Fast`
+  - `Low (Fast)`
   - `Thinking`
   - `권한`
   - `최근 출력`
   - `현재 상태`
   - `취소`
+- `Low (Fast)`는 `model_reasoning_effort=low` 별칭이며, 속도 2배 보장 모드는 아님
 - `/resume`은 세션 메뉴를 엶
 - 세션 메뉴에서:
   - 최근 세션 선택
@@ -88,9 +89,10 @@
 
 2026-03-20 로컬 검증 기준:
 
-- `scripts/run_tests.sh` 17개 통과
+- `scripts/run_tests.sh` 19개 통과
 - 새 레포 경로의 `codex-bridge`로 `new-session -> prompt -> delete-session` 실검증 완료
 - 새 레포 경로의 `codex-bridge`로 `resume -> read -> restore` 실검증 완료
+- 새 레포 경로의 `codex-bridge`로 `thinking fast -> reasoning low 저장 -> status 확인` 실검증 완료
 - 기존 사용자 서비스 `telegram-codex-relay.service`는 중지했고, 현재는 `codex-telegram-bridge.service`가 새 레포 경로를 사용 중
 
 ## 비용과 외부 의존성
