@@ -14,6 +14,7 @@
 - Telegram 슬래시 명령은 `/help`만 허용
 - 봇 시작 시 `setMyCommands`로 `/help`만 등록
 - `/help`는 버튼 메뉴만 표시
+- 실행 결과 메시지는 `codex>` / `relay>` / `error>` 헤더를 쓰는 CLI 스타일로 표시
 - 버튼 메뉴:
   - `세션`
   - `모델`
@@ -30,6 +31,7 @@
   - 최근 세션 선택
   - `새 세션 만들기`
   - `현재 세션 삭제`
+- 봇이 처음 세션 메뉴를 열 때, 별도 사용자 선택 이력이 없으면 `config.workdir`를 `/resume` 기본 기준 폴더로 자동 동기화
 - 세션 목록은 현재 디렉토리와 동일한 `cwd` 세션만 표시
 - 세션 디렉토리 브라우저에서:
   - 폴더 버튼으로 안쪽으로 이동
@@ -38,6 +40,7 @@
   - `이 폴더를 현재 디렉토리로 설정`
 - 세션 목록은 최신 활동 순으로 정렬
 - 세션 목록은 각 세션의 전체 `cwd`, 생성 시각, 수정 시각을 표시
+- 세션 선택 버튼 라벨은 `Codex /rename`으로 바뀐 세션명을 우선 표시
 - 새 세션 만들기는 `~/`부터 폴더 브라우저를 열고, 현재 폴더의 바로 아래 하위 폴더만 보여줌
 - 세션 브라우저에서:
   - 폴더 버튼으로 안쪽으로 이동
@@ -101,7 +104,7 @@
 
 2026-03-20 로컬 검증 기준:
 
-- `scripts/run_tests.sh` 25개 통과
+- `scripts/run_tests.sh` 26개 통과
 - 새 레포 경로의 `codex-bridge`로 `new-session -> prompt -> delete-session` 실검증 완료
 - 새 레포 경로의 `codex-bridge`로 `resume -> read -> restore` 실검증 완료
 - 새 레포 경로의 `codex-bridge`로 `fast off -> status -> fast on -> status` 실검증 완료
@@ -114,7 +117,7 @@
 - 설치 스크립트와 서비스는 conda base에 패키지를 설치하지 않음
 - 현재 서버에서 `systemctl --user is-enabled codex-telegram-bridge.service` = `enabled` 확인
 - 현재 서버에서 `loginctl show-user ubuntu -p Linger` = `Linger=yes` 확인
-- 기존 사용자 서비스 `telegram-codex-relay.service`는 중지했고, 현재는 `codex-telegram-bridge.service`가 새 레포 경로를 사용 중
+- 기존 사용자 서비스 `telegram-codex-relay.service`는 제거했고, 현재는 `codex-telegram-bridge.service`만 남아 있음
 
 ## 비용과 외부 의존성
 

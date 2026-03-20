@@ -318,10 +318,53 @@ class DirectTelegramCodexBot:
     def session_browser_root(self) -> Path:
         return Path.home()
 
-    def current_scope_path(self) -> Path:
+    def default_scope_path(self) -> Path:
+        return self.safe_directory(self.config.workdir, Path.home())
+
+    def ensure_default_resume_scope(self) -> Path:
+        default_scope = self.default_scope_path()
+        runtime = self.load_runtime_state()
+        if bool(runtime.get("session_scope_initialized")):
+            return default_scope
         state = self.load_bridge_state()
-        fallback = self.safe_directory(self.config.workdir, Path.home())
+        current_scope = self.safe_directory(state.get("session_scope_cwd"), default_scope)
+        if current_scope != default_scope:
+            try:
+                self.run_bridge(["set-workdir", str(default_scope)])
+            except Exception:
+                pass
+        self.write_runtime_state(
+            session_scope_initialized=True,
+            session_scope_user_selected=False,
+            default_scope_origin=str(default_scope),
+        )
+        return default_scope
+
+    def current_scope_path(self) -> Path:
+        self.ensure_default_resume_scope()
+        state = self.load_bridge_state()
+        fallback = self.default_scope_path()
         return self.safe_directory(state.get("session_scope_cwd") or state.get("workdir"), fallback)
+
+    def cli_mode_summary(self, state: dict[str, Any]) -> str:
+        return (
+            f"model: {format_state_value(state.get('model'))} | "
+            f"fast: {format_fast_mode_value(state.get('fast_mode'))} | "
+            f"thinking: {format_reasoning_value(state.get('reasoning_effort'))} | "
+            f"permission: {format_state_value(state.get('permission'), 'full')}"
+        )
+
+    def render_cli_message(self, source: str, title: str, body: str, *, state: dict[str, Any] | None = None) -> str:
+        bridge_state = dict(state or self.load_bridge_state())
+        lines = [
+            f"{source}> {title}",
+            f"session: {format_state_value(bridge_state.get('active_session_name'), '(none)')}",
+            f"cwd: {format_state_value(bridge_state.get('workdir'), self.config.workdir)}",
+            self.cli_mode_summary(bridge_state),
+            "",
+            body.strip() or "(empty reply)",
+        ]
+        return "\n".join(lines).strip()
 
     def browser_state(self, path_key: str, page_key: str, token_key: str, fallback: Path) -> tuple[Path, int, str]:
         data = self.load_runtime_state()
@@ -405,8 +448,9 @@ class DirectTelegramCodexBot:
         return sorted(entries, key=lambda entry: (entry.name.startswith("."), entry.name.lower()))
 
     def session_button_label(self, index: int, entry: dict[str, Any], active: bool) -> str:
-        cwd_name = Path(str(entry.get("cwd") or "")).name or str(entry.get("id") or index)
-        label = f"{index}. {cwd_name}"
+        session_name = str(entry.get("name") or "").strip()
+        fallback = Path(str(entry.get("cwd") or "")).name or str(entry.get("id") or index)
+        label = f"{index}. {session_name or fallback}"
         return label_with_check(active, truncate_button_label(label, max_chars=30))
 
     def browser_button_label(self, index: int, entry: Path) -> str:
@@ -893,7 +937,11 @@ class DirectTelegramCodexBot:
             code = running.process.returncode
             if code == 0:
                 message = stdout_text.strip() or "(empty reply)"
-                self.api.send_message(chat_id, message, reply_to_message_id=reply_to_message_id)
+                self.api.send_message(
+                    chat_id,
+                    self.render_cli_message("codex", "reply", message),
+                    reply_to_message_id=reply_to_message_id,
+                )
                 self.write_runtime_state(
                     status="idle",
                     current_job_id=None,
@@ -914,7 +962,11 @@ class DirectTelegramCodexBot:
                     )
                 else:
                     error = (stderr_text or stdout_text or f"bridge failed ({code})").strip()
-                    self.api.send_message(chat_id, f"처리 중 오류가 났습니다.\n{error}", reply_to_message_id=reply_to_message_id)
+                    self.api.send_message(
+                        chat_id,
+                        self.render_cli_message("error", "prompt", f"처리 중 오류가 났습니다.\n{error}"),
+                        reply_to_message_id=reply_to_message_id,
+                    )
                     self.write_runtime_state(
                         status="idle",
                         current_job_id=None,
@@ -924,7 +976,11 @@ class DirectTelegramCodexBot:
                         last_error=error,
                     )
         except Exception as exc:
-            self.api.send_message(chat_id, f"처리 중 오류가 났습니다.\n{exc}", reply_to_message_id=reply_to_message_id)
+            self.api.send_message(
+                chat_id,
+                self.render_cli_message("error", "prompt", f"처리 중 오류가 났습니다.\n{exc}"),
+                reply_to_message_id=reply_to_message_id,
+            )
             self.write_runtime_state(
                 status="idle",
                 current_job_id=None,
@@ -974,25 +1030,45 @@ class DirectTelegramCodexBot:
         if not command:
             if pending_parent is not None:
                 if self.current_runtime_status()[0] == "busy":
-                    self.api.send_message(chat_id, "작업 중에는 새 폴더 세션을 만들 수 없습니다.", reply_to_message_id=message_id)
+                    self.api.send_message(
+                        chat_id,
+                        self.render_cli_message("relay", "busy", "작업 중에는 새 폴더 세션을 만들 수 없습니다."),
+                        reply_to_message_id=message_id,
+                    )
                     return
                 try:
                     output = self.create_new_folder_session(text)
                 except Exception as exc:
                     self.api.send_message(
                         chat_id,
-                        f"새 폴더 세션 생성에 실패했습니다.\n{exc}\n\n다시 이름을 보내거나 취소 버튼을 누르세요.",
+                        self.render_cli_message(
+                            "error",
+                            "new-session",
+                            f"새 폴더 세션 생성에 실패했습니다.\n{exc}\n\n다시 이름을 보내거나 취소 버튼을 누르세요.",
+                        ),
                         reply_to_message_id=message_id,
                     )
                     return
-                self.api.send_message(chat_id, output, reply_to_message_id=message_id)
+                self.api.send_message(
+                    chat_id,
+                    self.render_cli_message("relay", "new-session", output),
+                    reply_to_message_id=message_id,
+                )
                 self.send_menu(chat_id, "resume")
                 return
             busy_error = self.start_prompt(chat_id, text, message_id)
             if busy_error:
-                self.api.send_message(chat_id, busy_error, reply_to_message_id=message_id)
+                self.api.send_message(
+                    chat_id,
+                    self.render_cli_message("relay", "busy", busy_error),
+                    reply_to_message_id=message_id,
+                )
                 return
-            self.api.send_message(chat_id, "Codex에 전달했습니다. 처리 중입니다.", reply_to_message_id=message_id)
+            self.api.send_message(
+                chat_id,
+                self.render_cli_message("codex", "processing", "Codex에 전달했습니다. 처리 중입니다."),
+                reply_to_message_id=message_id,
+            )
             return
 
         name, args = command
@@ -1024,23 +1100,23 @@ class DirectTelegramCodexBot:
                 return
             if kind == "read":
                 output = self.run_bridge(["read"])
-                self.api.send_message(chat_id, output)
+                self.api.send_message(chat_id, self.render_cli_message("relay", "read", output))
                 self.api.answer_callback_query(callback_id)
                 return
             if kind == "status":
                 output = self.run_bridge(["status"])
-                self.api.send_message(chat_id, self.append_runtime_status(output))
+                self.api.send_message(chat_id, self.render_cli_message("relay", "status", self.append_runtime_status(output)))
                 self.api.answer_callback_query(callback_id)
                 return
             if kind == "cancel":
                 if self.pending_new_folder_parent() is not None:
                     self.set_pending_new_folder_parent(None)
-                    self.api.send_message(chat_id, "새 폴더 생성 입력을 취소했습니다.")
+                    self.api.send_message(chat_id, self.render_cli_message("relay", "cancel", "새 폴더 생성 입력을 취소했습니다."))
                     self.send_menu(chat_id, "session-browser")
                     self.api.answer_callback_query(callback_id, "입력 취소")
                     return
                 output = self.cancel_running_prompt()
-                self.api.send_message(chat_id, output)
+                self.api.send_message(chat_id, self.render_cli_message("relay", "cancel", output))
                 self.api.answer_callback_query(callback_id)
                 return
             if kind == "resume" and value:
@@ -1048,7 +1124,7 @@ class DirectTelegramCodexBot:
                     self.api.answer_callback_query(callback_id, "작업 중에는 세션 전환을 잠시 막습니다.")
                     return
                 output = self.run_bridge(["resume", value])
-                self.api.send_message(chat_id, output)
+                self.api.send_message(chat_id, self.render_cli_message("relay", "resume", output))
                 self.send_menu(chat_id, "resume")
                 self.api.answer_callback_query(callback_id, "세션 전환 완료")
                 return
@@ -1057,7 +1133,7 @@ class DirectTelegramCodexBot:
                     self.api.answer_callback_query(callback_id, "작업 중에는 현재 세션을 삭제할 수 없습니다.")
                     return
                 output = self.run_bridge(["delete-session"])
-                self.api.send_message(chat_id, output)
+                self.api.send_message(chat_id, self.render_cli_message("relay", "delete-session", output))
                 self.send_menu(chat_id, "resume")
                 self.api.answer_callback_query(callback_id, "현재 세션 삭제 완료")
                 return
@@ -1115,9 +1191,13 @@ class DirectTelegramCodexBot:
                     self.set_pending_new_folder_parent(current_path)
                     self.api.send_message(
                         chat_id,
-                        "새 폴더 이름을 다음 메시지로 보내세요.\n"
-                        f"- parent: {current_path}\n"
-                        "- 취소하려면 취소 버튼",
+                        self.render_cli_message(
+                            "relay",
+                            "mkdir",
+                            "새 폴더 이름을 다음 메시지로 보내세요.\n"
+                            f"- parent: {current_path}\n"
+                            "- 취소하려면 취소 버튼",
+                        ),
                     )
                     self.api.answer_callback_query(callback_id, "폴더 이름 입력 대기")
                     return
@@ -1127,7 +1207,7 @@ class DirectTelegramCodexBot:
                         return
                     self.set_pending_new_folder_parent(None)
                     output = self.run_bridge(["new-session", str(current_path)], timeout_ms=120_000)
-                    self.api.send_message(chat_id, output)
+                    self.api.send_message(chat_id, self.render_cli_message("relay", "new-session", output))
                     self.send_menu(chat_id, "resume")
                     self.api.answer_callback_query(callback_id, "새 세션 생성 완료")
                     return
@@ -1175,7 +1255,12 @@ class DirectTelegramCodexBot:
                     return
                 if subaction == "set":
                     output = self.run_bridge(["set-workdir", str(current_path)])
-                    self.api.send_message(chat_id, output)
+                    self.write_runtime_state(
+                        session_scope_initialized=True,
+                        session_scope_user_selected=True,
+                        default_scope_origin=str(self.default_scope_path()),
+                    )
+                    self.api.send_message(chat_id, self.render_cli_message("relay", "set-workdir", output))
                     self.send_menu(chat_id, "resume")
                     self.api.answer_callback_query(callback_id, "현재 디렉토리 설정 완료")
                     return
@@ -1183,13 +1268,13 @@ class DirectTelegramCodexBot:
                 return
             if kind == "model" and value:
                 output = self.run_bridge(["model", value])
-                self.api.send_message(chat_id, output)
+                self.api.send_message(chat_id, self.render_cli_message("relay", "model", output))
                 self.send_menu(chat_id, "thinking")
                 self.api.answer_callback_query(callback_id, "모델 변경 완료")
                 return
             if kind == "fast":
                 output = self.run_bridge(["fast", value or "toggle"])
-                self.api.send_message(chat_id, output)
+                self.api.send_message(chat_id, self.render_cli_message("relay", "fast", output))
                 self.send_menu(chat_id, "help")
                 self.api.answer_callback_query(callback_id, "Fast mode 변경 완료")
                 return
@@ -1198,18 +1283,18 @@ class DirectTelegramCodexBot:
                 state = self.load_bridge_state()
                 actual = format_reasoning_value(state.get("reasoning_effort"))
                 output = f"{output}\n- 현재 저장값: {actual}"
-                self.api.send_message(chat_id, output)
+                self.api.send_message(chat_id, self.render_cli_message("relay", "thinking", output, state=state))
                 self.api.answer_callback_query(callback_id, f"thinking 저장: {actual}")
                 return
             if kind == "permission" and value:
                 output = self.run_bridge(["permission", value])
-                self.api.send_message(chat_id, output)
+                self.api.send_message(chat_id, self.render_cli_message("relay", "permission", output))
                 self.api.answer_callback_query(callback_id, "권한 변경 완료")
                 return
             self.api.answer_callback_query(callback_id, "지원하지 않는 버튼입니다.")
         except Exception as exc:
             self.api.answer_callback_query(callback_id, "오류")
-            self.api.send_message(chat_id, f"처리 중 오류가 났습니다.\n{exc}")
+            self.api.send_message(chat_id, self.render_cli_message("error", "callback", f"처리 중 오류가 났습니다.\n{exc}"))
 
     def process_update(self, update: dict[str, Any]) -> None:
         if "message" in update:

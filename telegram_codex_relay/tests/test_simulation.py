@@ -211,6 +211,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
 
     def test_resume_menu_includes_create_and_delete_buttons(self):
         self.bot.fake_state["session_scope_cwd"] = str(Path(self.bot.config.workdir) / "project-a")
+        self.bot.write_runtime_state(session_scope_initialized=True, session_scope_user_selected=True)
         text, buttons = self.bot.build_resume_menu()
         self.assertIn("Codex 세션", text)
         self.assertIn("세션 기준 폴더:", text)
@@ -219,14 +220,24 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertEqual(buttons[0][0]["text"], "디렉토리 설정")
         self.assertEqual(buttons[0][1]["text"], "새 세션 만들기")
         self.assertEqual(buttons[1][0]["text"], "현재 세션 삭제")
+        self.assertIn("Primary Session", buttons[2][0]["text"])
 
     def test_resume_menu_filters_sessions_by_current_directory(self):
         self.bot.fake_state["session_scope_cwd"] = str(Path(self.bot.config.workdir) / "project-a")
+        self.bot.write_runtime_state(session_scope_initialized=True, session_scope_user_selected=True)
         text, _ = self.bot.build_resume_menu()
         self.assertIn(str(Path(self.bot.config.workdir) / "project-a"), text)
         self.assertNotIn(str(Path(self.bot.config.workdir) / "project-a" / "nested"), text)
         self.assertNotIn(str(Path(self.bot.config.workdir) / "project-b"), text)
         self.assertEqual(self.bot.bridge_calls[0]["args"], ["sessions-json", "12", str(Path(self.bot.config.workdir) / "project-a")])
+
+    def test_resume_menu_initializes_scope_to_config_workdir_once(self):
+        stale_scope = Path(self.bot.config.workdir) / "project-b"
+        self.bot.fake_state["session_scope_cwd"] = str(stale_scope)
+        text, _ = self.bot.build_resume_menu()
+        self.assertEqual(self.bot.bridge_calls[0]["args"], ["set-workdir", str(Path(self.bot.config.workdir))])
+        self.assertEqual(self.bot.bridge_calls[1]["args"], ["sessions-json", "12", str(Path(self.bot.config.workdir))])
+        self.assertIn(str(Path(self.bot.config.workdir)), text)
 
     def test_model_callback_sets_model_and_opens_thinking_menu(self):
         self.bot.handle_callback(
@@ -237,7 +248,8 @@ class TelegramRelaySimulationTests(unittest.TestCase):
             }
         )
         self.assertEqual(self.bot.bridge_calls[0]["args"], ["model", "gpt-5.4-mini"])
-        self.assertEqual(self.bot.api.sent[0]["text"], "Codex 모델 오버라이드를 저장했습니다: gpt-5.4-mini")
+        self.assertIn("relay> model", self.bot.api.sent[0]["text"])
+        self.assertIn("Codex 모델 오버라이드를 저장했습니다: gpt-5.4-mini", self.bot.api.sent[0]["text"])
         self.assertIn("Codex thinking 선택", self.bot.api.sent[1]["text"])
         self.assertEqual(self.bot.api.answered[-1]["text"], "모델 변경 완료")
 
@@ -275,12 +287,14 @@ class TelegramRelaySimulationTests(unittest.TestCase):
     def test_plain_text_starts_prompt_and_sends_processing_notice(self):
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 77, "text": "파일 하나 만들어줘"})
         self.assertEqual(self.bot.prompt_calls[0]["prompt_text"], "파일 하나 만들어줘")
-        self.assertEqual(self.bot.api.sent[-1]["text"], "Codex에 전달했습니다. 처리 중입니다.")
+        self.assertIn("codex> processing", self.bot.api.sent[-1]["text"])
+        self.assertIn("Codex에 전달했습니다. 처리 중입니다.", self.bot.api.sent[-1]["text"])
 
     def test_busy_prompt_returns_busy_message(self):
         self.bot.prompt_error = "이미 Codex 작업이 실행 중입니다."
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 78, "text": "또 작업"})
-        self.assertEqual(self.bot.api.sent[-1]["text"], "이미 Codex 작업이 실행 중입니다.")
+        self.assertIn("relay> busy", self.bot.api.sent[-1]["text"])
+        self.assertIn("이미 Codex 작업이 실행 중입니다.", self.bot.api.sent[-1]["text"])
 
     def test_status_button_appends_runtime_when_busy(self):
         self.bot.runtime_busy = True
@@ -291,6 +305,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
                 "message": {"chat": {"id": 111111111}},
             }
         )
+        self.assertIn("relay> status", self.bot.api.sent[-1]["text"])
         self.assertIn("Runtime:", self.bot.api.sent[-1]["text"])
         self.assertIn("activeSessionId: sess-active", self.bot.api.sent[-1]["text"])
         self.assertIn("fastMode: off", self.bot.api.sent[-1]["text"])
@@ -335,6 +350,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
     def test_resume_browser_shows_directory_and_session_preview(self):
         browser_root = self.tmpdir / "project-a"
         (browser_root / "nested").mkdir(parents=True, exist_ok=True)
+        self.bot.write_runtime_state(session_scope_initialized=True, session_scope_user_selected=True)
         self.bot.write_runtime_state(resume_browser_path=str(browser_root), resume_browser_page=0, resume_browser_token="token-r")
         text, buttons = self.bot.build_resume_browser_menu()
         self.assertIn("세션 디렉토리 선택", text)
@@ -356,6 +372,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
             }
         )
         self.assertEqual(self.bot.bridge_calls[0]["args"], ["set-workdir", str(target)])
+        self.assertIn("relay> set-workdir", self.bot.api.sent[0]["text"])
         self.assertIn("현재 디렉토리를 저장했습니다.", self.bot.api.sent[0]["text"])
         self.assertIn("세션 기준 폴더:", self.bot.api.sent[1]["text"])
         self.assertIn(str(target), self.bot.api.sent[1]["text"])
@@ -363,6 +380,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
     def test_resume_scope_persists_after_resuming_other_session(self):
         scope = Path(self.bot.config.workdir) / "project-a"
         self.bot.fake_state["session_scope_cwd"] = str(scope)
+        self.bot.write_runtime_state(session_scope_initialized=True, session_scope_user_selected=True)
         self.bot.handle_callback(
             {
                 "id": "cb-2",
@@ -414,6 +432,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
             }
         )
         self.assertEqual(self.bot.bridge_calls[0]["args"], ["delete-session"])
+        self.assertIn("relay> delete-session", self.bot.api.sent[0]["text"])
         self.assertIn("현재 Codex 세션을 삭제했습니다.", self.bot.api.sent[0]["text"])
 
     def test_unknown_command_redirects_to_help(self):
@@ -447,6 +466,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
             self.bot._wait_prompt("111111111", 81, running, "reply with ok")
 
         self.assertEqual(process.received_input, "reply with ok\n")
+        self.assertIn("codex> reply", self.bot.api.sent[-1]["text"])
         self.assertIn("DIRECT_PROMPT_OK", self.bot.api.sent[-1]["text"])
         write_runtime_state.assert_called()
 
