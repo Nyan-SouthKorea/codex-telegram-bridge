@@ -3,7 +3,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_PATH="${CODEX_TELEGRAM_BRIDGE_CONFIG:-$REPO_ROOT/telegram_codex_relay/config.json}"
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
+VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv}"
+SYSTEM_PYTHON="${SYSTEM_PYTHON:-/usr/bin/python3}"
 UNIT_NAME="codex-telegram-bridge.service"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT_PATH="$UNIT_DIR/$UNIT_NAME"
@@ -15,6 +16,16 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
   exit 1
 fi
 
+if [[ ! -x "$SYSTEM_PYTHON" ]]; then
+  SYSTEM_PYTHON="$(command -v python3)"
+fi
+
+if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+  "$SYSTEM_PYTHON" -m venv "$VENV_DIR"
+fi
+
+PYTHON_BIN="${PYTHON_BIN:-$VENV_DIR/bin/python}"
+
 mkdir -p "$UNIT_DIR"
 
 sed \
@@ -24,7 +35,8 @@ sed \
   "$TEMPLATE_PATH" > "$UNIT_PATH"
 
 systemctl --user daemon-reload
-systemctl --user enable --now "$UNIT_NAME"
+systemctl --user enable "$UNIT_NAME"
+systemctl --user restart "$UNIT_NAME"
 
 echo "설치 완료: $UNIT_PATH"
 systemctl --user --no-pager status "$UNIT_NAME" || true

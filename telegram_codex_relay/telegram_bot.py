@@ -3,6 +3,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -431,9 +432,13 @@ class DirectTelegramCodexBot:
                 self.running_prompt = None
             return "idle", None
 
+    def bridge_command(self, args: list[str]) -> list[str]:
+        # Always launch the bridge with the same interpreter as the running bot.
+        return [sys.executable, self.config.bridge_path, *args]
+
     def run_bridge(self, args: list[str], stdin_text: str | None = None, timeout_ms: int = CONTROL_BRIDGE_TIMEOUT_MS) -> str:
         result = subprocess.run(
-            [self.config.bridge_path, *args],
+            self.bridge_command(args),
             input=stdin_text,
             cwd=self.config.workdir,
             env=self.bridge_env(),
@@ -828,7 +833,7 @@ class DirectTelegramCodexBot:
         status, _ = self.current_runtime_status()
         if status == "busy":
             return self.prompt_busy_message()
-        command = [self.config.bridge_path, "prompt"]
+        command = self.bridge_command(["prompt"])
         proc = subprocess.Popen(
             command,
             cwd=self.config.workdir,

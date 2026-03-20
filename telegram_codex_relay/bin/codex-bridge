@@ -6,10 +6,17 @@ import sqlite3
 import subprocess
 import sys
 import time
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:  # pragma: no cover
+        tomllib = None  # type: ignore[assignment]
 
 
 RELAY_DIR = Path(__file__).resolve().parents[1]
@@ -81,6 +88,8 @@ def normalize_model_value(value: str | None) -> str | None:
 def load_user_config_defaults() -> dict[str, Any]:
     config_path = CODEX_HOME / "config.toml"
     if not config_path.exists():
+        return {}
+    if tomllib is None:
         return {}
     try:
         return tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -241,7 +250,7 @@ def get_thread(thread_id: str) -> ThreadEntry | None:
     query = """
         select id, title, cwd, created_at, updated_at, rollout_path, sandbox_policy, approval_mode, model_provider, cli_version
         from threads
-        where id = ?
+        where id = ? and archived = 0
     """
     with open_state_db() as conn:
         row = conn.execute(query, (thread_id,)).fetchone()

@@ -3,7 +3,7 @@
 ## 전제 조건
 
 - Linux 환경
-- `python3`
+- `/usr/bin/python3` 또는 venv 생성 가능한 시스템 Python
 - `Codex CLI` 설치 및 로그인 완료
 - Telegram 봇 생성 완료
 - `telegram_codex_relay/config.json` 작성 완료
@@ -21,12 +21,14 @@ cd codex-telegram-bridge
 scripts/run_tests.sh
 ```
 
+이 스크립트는 `.venv`가 있으면 그 Python을 우선 사용합니다.
+
 ## 3. 브리지 상태 확인
 
 직접 브리지 상태를 볼 수 있습니다.
 
 ```bash
-python3 telegram_codex_relay/bin/codex-bridge status
+.venv/bin/python telegram_codex_relay/bin/codex-bridge status
 ```
 
 ## 4. 수동 실행
@@ -34,14 +36,14 @@ python3 telegram_codex_relay/bin/codex-bridge status
 먼저 foreground에서 확인하려면:
 
 ```bash
-python3 telegram_codex_relay/telegram_bot.py
+.venv/bin/python telegram_codex_relay/telegram_bot.py
 ```
 
 이 상태에서 Telegram DM에서 `/help`를 보내면 됩니다.
 
 ## 5. 사용자 서비스 설치
 
-`systemd --user`를 쓴다면 아래 스크립트로 설치합니다.
+`systemd --user`를 쓴다면 아래 스크립트로 설치합니다. 이 스크립트는 `.venv`가 없으면 자동 생성하고, 서비스도 `.venv/bin/python`으로 고정합니다.
 
 ```bash
 scripts/install_user_service.sh

@@ -24,14 +24,8 @@
 
 ## 보안 원칙
 
-- 아래 값은 절대 커밋하지 않습니다.
-  - 실제 `bot_token`
-  - 실제 `allowed_chat_id`
-  - 런타임 상태 파일
-  - Codex 세션 상태 파일
-  - 개인 로그 전문
-- 예시 설정은 `config.example.json`로만 제공합니다.
-- 문서 예시에는 항상 placeholder를 사용합니다.
+- 보안 규칙의 본문은 [docs/security.md](security.md)를 기준으로 봅니다.
+- 이 문서에는 보안 세부 항목을 중복 복사하지 않습니다.
 
 ## 구현 원칙
 

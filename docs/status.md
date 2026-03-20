@@ -3,7 +3,8 @@
 ## 프로젝트 목표
 
 이 레포는 `Telegram DM`에서 `Codex CLI`를 직접 제어하는 브리지를 제공합니다.  
-현재 기준 아키텍처는 `Telegram Bot API -> telegram_bot.py -> codex-bridge -> codex exec`입니다.
+현재 기준 아키텍처는 `Telegram Bot API -> telegram_bot.py -> codex-bridge -> codex exec`입니다.  
+운영 런타임은 레포 내부 `.venv`입니다.
 
 ## 현재 구현 상태
 
@@ -108,6 +109,10 @@
 - 실제 `Codex CLI` 도움말 기준 `resume --all`이 cwd filtering 해제 옵션임을 확인했고, 브리지는 기본값을 동일 cwd 필터로 맞춤
 - Telegram Bot API `getMyCommands` 기준 `/help`만 등록된 것 확인
 - `codex-telegram-bridge.service` 재시작 후 `active` 확인
+- `codex-telegram-bridge.service`가 `/data2/iena/codex-telegram-bridge/.venv/bin/python`으로 실행되는 것 확인
+- 현재 운영 서비스는 conda base가 아니라 레포 내부 `.venv`만 사용
+- 현재 서버에서 `systemctl --user is-enabled codex-telegram-bridge.service` = `enabled` 확인
+- 현재 서버에서 `loginctl show-user ubuntu -p Linger` = `Linger=yes` 확인
 - 기존 사용자 서비스 `telegram-codex-relay.service`는 중지했고, 현재는 `codex-telegram-bridge.service`가 새 레포 경로를 사용 중
 
 ## 비용과 외부 의존성

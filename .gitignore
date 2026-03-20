@@ -1,4 +1,5 @@
 /.pytest_cache/
+/.venv/
 /telegram_codex_relay/__pycache__/
 /telegram_codex_relay/bin/__pycache__/
 /telegram_codex_relay/tests/__pycache__/

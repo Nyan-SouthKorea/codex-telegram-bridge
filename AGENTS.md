@@ -1,4 +1,4 @@
 # Agent Guide
 
-작업 규칙의 기준 문서는 [docs/agent.md](docs/agent.md) 입니다.  
-이 파일은 엔트리포인트만 담당하고, 규칙 본문은 중복 작성하지 않습니다.
+기준 문서는 [docs/agent.md](docs/agent.md) 하나입니다.
+이 파일은 엔트리포인트 역할만 하며, 규칙 본문은 여기서 반복하지 않습니다.
