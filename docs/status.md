@@ -6,6 +6,13 @@
 현재 기준 아키텍처는 `Telegram Bot API -> telegram_bot.py -> codex-bridge -> codex exec`입니다.  
 운영 런타임은 레포 내부 `.venv`입니다.
 
+## 현재 운영 기준
+
+- 비사소한 작업 단위는 `AGENTS.md -> docs/README.md -> docs/status.md` 순서로 다시 확인합니다.
+- 문서 비교, 대규모 정리, 컨텍스트 사용량이 큰 작업은 먼저 계획 문서를 만들거나 기존 계획 문서를 갱신합니다.
+- 서비스나 런타임 상태를 설명할 때는 실제 `systemctl --user status`, `journalctl`, `codex-bridge status` 같은 현재 근거를 다시 확인합니다.
+- 문서를 기준으로 사용자에게 안내할 때는 짧고 분명하게 설명하되, 친절한 말투를 사용합니다.
+
 ## 현재 구현 상태
 
 - `OpenClaw` 의존 없음
@@ -30,6 +37,7 @@
   - `디렉토리 설정`
   - 최근 세션 선택
   - `새 세션 만들기`
+  - `이름 변경`
   - `현재 세션 종료`
   - `현재 세션 삭제`
 - 봇이 처음 세션 메뉴를 열 때, 별도 사용자 선택 이력이 없으면 `config.workdir`를 `/resume` 기본 기준 폴더로 자동 동기화
@@ -41,13 +49,15 @@
   - `이 폴더를 현재 디렉토리로 설정`
 - 세션 목록은 최신 활동 순으로 정렬
 - 세션 목록은 각 세션의 전체 `cwd`, 생성 시각, 수정 시각을 표시
-- 세션 선택 버튼 라벨은 `Codex /rename`으로 바뀐 세션명을 우선 표시
+- 세션 선택 버튼 라벨은 `Codex /rename` 또는 Telegram `이름 변경`으로 바뀐 세션명을 우선 표시
 - 새 세션 만들기는 `~/`부터 폴더 브라우저를 열고, 현재 폴더의 바로 아래 하위 폴더만 보여줌
 - 세션 브라우저에서:
   - 폴더 버튼으로 안쪽으로 이동
   - `../` 버튼으로 상위 폴더 이동
   - `현재 폴더로 세션 시작`
   - `새 폴더 만들기`를 누른 뒤 다음 일반 메시지로 폴더 이름을 보내 새 폴더 생성 후 세션 시작
+- 현재 세션 이름 변경은 다음 일반 메시지로 새 이름을 받아 적용
+- 현재 세션 이름 변경은 Codex state DB title과 `~/.codex/session_index.jsonl`의 `thread_name`을 함께 갱신
 - 현재 세션 종료는 active 세션만 해제하고 archive하지 않음
 - 현재 세션 종료 뒤 다음 평문은 새 active 세션으로 시작하고, 종료한 세션은 나중에 다시 resume 가능
 - 현재 세션 삭제는 active 세션만 archive 처리
@@ -99,6 +109,7 @@
 - 실제 `Codex bridge`로 새 세션 생성 확인
 - 실제 `Codex bridge`로 `resume -> read` 즉시 확인
 - 실제 `Codex bridge`로 최소 프롬프트 실행 확인
+- 단위/시뮬레이션으로 현재 세션 이름 변경이 DB title과 `session_index.jsonl`을 함께 갱신하는 것 확인
 - 단위/시뮬레이션으로 현재 세션 종료가 archive 없이 active만 해제하는 것 확인
 - 실제 `Codex bridge`로 현재 세션 archive 삭제 확인
 - `scripts/get_chat_id.py` 실행 확인
@@ -108,8 +119,10 @@
 
 2026-03-20 로컬 검증 기준:
 
-- `scripts/run_tests.sh` 30개 통과
+- `scripts/run_tests.sh` 33개 통과
 - `python3 -m py_compile telegram_codex_relay/telegram_bot.py telegram_codex_relay/bin/codex-bridge telegram_codex_relay/tests/test_simulation.py` 통과
+- `이름 변경` 버튼이 다음 일반 메시지로 세션 이름을 받고, bridge `rename-session`으로 반영하는 시뮬레이션 테스트 통과
+- `rename-session`이 Codex state DB title과 `~/.codex/session_index.jsonl`의 `thread_name`을 함께 갱신하는 단위 테스트 통과
 - `현재 세션 종료` 버튼과 `close-session`이 archive 없이 active 세션만 해제하는 시뮬레이션/단위 테스트 통과
 - 새 레포 경로의 `codex-bridge`로 `new-session -> prompt -> delete-session` 실검증 완료
 - 새 레포 경로의 `codex-bridge`로 `resume -> read -> restore` 실검증 완료

@@ -414,6 +414,24 @@ class DirectTelegramCodexBot:
             return
         self.write_runtime_state(pending_new_folder_parent=str(path.expanduser().resolve()))
 
+    def pending_session_rename(self) -> tuple[str | None, str | None]:
+        data = self.load_runtime_state()
+        session_id = str(data.get("pending_session_rename_id") or "").strip() or None
+        session_name = str(data.get("pending_session_rename_name") or "").strip() or None
+        return session_id, session_name
+
+    def set_pending_session_rename(self, session_id: str | None, session_name: str | None = None) -> None:
+        if session_id is None:
+            self.write_runtime_state(
+                pending_session_rename_id=None,
+                pending_session_rename_name=None,
+            )
+            return
+        self.write_runtime_state(
+            pending_session_rename_id=str(session_id).strip(),
+            pending_session_rename_name=str(session_name or "").strip() or None,
+        )
+
     def set_session_browser_state(self, path: Path, page: int = 0) -> str:
         return self.set_browser_state(
             "session_browser_path",
@@ -505,6 +523,7 @@ class DirectTelegramCodexBot:
                 "- 설정과 조회는 버튼으로만 합니다.",
                 "- 권한이 full이면 지속 세션, read/deny면 격리 1회 실행입니다.",
                 "- 세션 메뉴의 `디렉토리 설정`으로 /resume 기준 폴더를 바꿀 수 있습니다.",
+                "- 세션 메뉴의 `이름 변경`은 현재 세션 이름을 바꿉니다.",
                 "- 세션 메뉴의 `현재 세션 종료`는 `/exit`처럼 현재 세션만 닫고 기록은 유지합니다.",
                 "- `Fast`는 실제 Codex Fast mode 토글입니다.",
                 "",
@@ -543,6 +562,7 @@ class DirectTelegramCodexBot:
         entries = json.loads(raw)
         rows: list[list[dict[str, str]]] = []
         active_id = str(state.get("active_session_id") or "").strip()
+        pending_rename_id, pending_rename_name = self.pending_session_rename()
         text_lines = [
             "Codex 세션",
             f"현재 세션: {format_state_value(state.get('active_session_name'), '(none)')}",
@@ -552,6 +572,15 @@ class DirectTelegramCodexBot:
             "최근 세션 순서: 최신 활동 순",
             "",
         ]
+        if pending_rename_id:
+            text_lines.extend(
+                [
+                    "세션 이름 변경 입력 대기 중",
+                    f"- target: {pending_rename_name or pending_rename_id}",
+                    "- 다음 일반 메시지로 새 이름을 보내세요.",
+                    "",
+                ]
+            )
         rows.append(
             [
                 {"text": "디렉토리 설정", "callback_data": button_data("menu", "resume-browser")},
@@ -560,7 +589,12 @@ class DirectTelegramCodexBot:
         )
         rows.append(
             [
+                {"text": "이름 변경", "callback_data": button_data("session", "rename")},
                 {"text": "현재 세션 종료", "callback_data": button_data("session", "close")},
+            ]
+        )
+        rows.append(
+            [
                 {"text": "현재 세션 삭제", "callback_data": button_data("session", "delete")},
             ]
         )
@@ -854,6 +888,16 @@ class DirectTelegramCodexBot:
         self.set_pending_new_folder_parent(None)
         return output
 
+    def rename_session(self, session_id: str, session_name: str) -> str:
+        raw_name = session_name.strip()
+        if not raw_name:
+            raise RuntimeError("새 세션 이름이 비어 있습니다.")
+        if "\n" in raw_name or "\r" in raw_name:
+            raise RuntimeError("세션 이름은 한 줄로 입력하세요.")
+        output = self.run_bridge(["rename-session", session_id, raw_name], timeout_ms=120_000)
+        self.set_pending_session_rename(None)
+        return output
+
     def cancel_running_prompt(self) -> str:
         with self.running_lock:
             running = self.running_prompt
@@ -1028,6 +1072,7 @@ class DirectTelegramCodexBot:
             return
         message_id = int(message.get("message_id"))
         pending_parent = self.pending_new_folder_parent()
+        pending_rename_id, _ = self.pending_session_rename()
         command = parse_command(text)
         if not command:
             if pending_parent is not None:
@@ -1054,6 +1099,34 @@ class DirectTelegramCodexBot:
                 self.api.send_message(
                     chat_id,
                     self.render_cli_message("relay", "new-session", output),
+                    reply_to_message_id=message_id,
+                )
+                self.send_menu(chat_id, "resume")
+                return
+            if pending_rename_id is not None:
+                if self.current_runtime_status()[0] == "busy":
+                    self.api.send_message(
+                        chat_id,
+                        self.render_cli_message("relay", "busy", "작업 중에는 세션 이름을 변경할 수 없습니다."),
+                        reply_to_message_id=message_id,
+                    )
+                    return
+                try:
+                    output = self.rename_session(pending_rename_id, text)
+                except Exception as exc:
+                    self.api.send_message(
+                        chat_id,
+                        self.render_cli_message(
+                            "error",
+                            "rename-session",
+                            f"세션 이름 변경에 실패했습니다.\n{exc}\n\n다시 이름을 보내거나 취소 버튼을 누르세요.",
+                        ),
+                        reply_to_message_id=message_id,
+                    )
+                    return
+                self.api.send_message(
+                    chat_id,
+                    self.render_cli_message("relay", "rename-session", output),
                     reply_to_message_id=message_id,
                 )
                 self.send_menu(chat_id, "resume")
@@ -1097,6 +1170,8 @@ class DirectTelegramCodexBot:
             if kind == "menu":
                 if value != "session-browser":
                     self.set_pending_new_folder_parent(None)
+                if value != "resume":
+                    self.set_pending_session_rename(None)
                 self.send_menu(chat_id, value or "help")
                 self.api.answer_callback_query(callback_id)
                 return
@@ -1117,6 +1192,13 @@ class DirectTelegramCodexBot:
                     self.send_menu(chat_id, "session-browser")
                     self.api.answer_callback_query(callback_id, "입력 취소")
                     return
+                pending_rename_id, _ = self.pending_session_rename()
+                if pending_rename_id is not None:
+                    self.set_pending_session_rename(None)
+                    self.api.send_message(chat_id, self.render_cli_message("relay", "cancel", "세션 이름 변경 입력을 취소했습니다."))
+                    self.send_menu(chat_id, "resume")
+                    self.api.answer_callback_query(callback_id, "입력 취소")
+                    return
                 output = self.cancel_running_prompt()
                 self.api.send_message(chat_id, self.render_cli_message("relay", "cancel", output))
                 self.api.answer_callback_query(callback_id)
@@ -1125,15 +1207,43 @@ class DirectTelegramCodexBot:
                 if self.current_runtime_status()[0] == "busy":
                     self.api.answer_callback_query(callback_id, "작업 중에는 세션 전환을 잠시 막습니다.")
                     return
+                self.set_pending_session_rename(None)
                 output = self.run_bridge(["resume", value])
                 self.api.send_message(chat_id, self.render_cli_message("relay", "resume", output))
                 self.send_menu(chat_id, "resume")
                 self.api.answer_callback_query(callback_id, "세션 전환 완료")
                 return
+            if kind == "session" and value == "rename":
+                if self.current_runtime_status()[0] == "busy":
+                    self.api.answer_callback_query(callback_id, "작업 중에는 현재 세션 이름을 변경할 수 없습니다.")
+                    return
+                state = self.load_bridge_state()
+                active_id = str(state.get("active_session_id") or "").strip()
+                active_name = str(state.get("active_session_name") or "").strip()
+                if not active_id:
+                    self.api.answer_callback_query(callback_id, "이름을 바꿀 현재 세션이 없습니다.")
+                    return
+                self.set_pending_new_folder_parent(None)
+                self.set_pending_session_rename(active_id, active_name or active_id)
+                self.api.send_message(
+                    chat_id,
+                    self.render_cli_message(
+                        "relay",
+                        "rename-session",
+                        "새 세션 이름을 다음 메시지로 보내세요.\n"
+                        f"- current: {active_name or active_id}\n"
+                        "- 취소하려면 취소 버튼",
+                        state=state,
+                    ),
+                )
+                self.send_menu(chat_id, "resume")
+                self.api.answer_callback_query(callback_id, "새 이름 입력 대기")
+                return
             if kind == "session" and value == "delete":
                 if self.current_runtime_status()[0] == "busy":
                     self.api.answer_callback_query(callback_id, "작업 중에는 현재 세션을 삭제할 수 없습니다.")
                     return
+                self.set_pending_session_rename(None)
                 output = self.run_bridge(["delete-session"])
                 self.api.send_message(chat_id, self.render_cli_message("relay", "delete-session", output))
                 self.send_menu(chat_id, "resume")
@@ -1143,6 +1253,7 @@ class DirectTelegramCodexBot:
                 if self.current_runtime_status()[0] == "busy":
                     self.api.answer_callback_query(callback_id, "작업 중에는 현재 세션을 종료할 수 없습니다.")
                     return
+                self.set_pending_session_rename(None)
                 output = self.run_bridge(["close-session"])
                 self.api.send_message(chat_id, self.render_cli_message("relay", "close-session", output))
                 self.send_menu(chat_id, "resume")
@@ -1199,6 +1310,7 @@ class DirectTelegramCodexBot:
                     if self.current_runtime_status()[0] == "busy":
                         self.api.answer_callback_query(callback_id, "작업 중에는 새 폴더 세션을 만들 수 없습니다.")
                         return
+                    self.set_pending_session_rename(None)
                     self.set_pending_new_folder_parent(current_path)
                     self.api.send_message(
                         chat_id,

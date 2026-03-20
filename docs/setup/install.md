@@ -41,6 +41,8 @@ scripts/run_tests.sh
 
 이 상태에서 Telegram DM에서 `/help`를 보내면 됩니다.
 
+같은 `bot_token`으로 foreground 실행과 `systemd --user` 서비스를 동시에 띄우지는 마세요.
+
 ## 5. 사용자 서비스 설치
 
 `systemd --user`를 쓴다면 아래 스크립트로 설치합니다. 이 스크립트는 `.venv`가 없으면 자동 생성하고, 서비스도 `.venv/bin/python`으로 고정합니다.
@@ -86,6 +88,8 @@ systemctl --user status codex-telegram-bridge.service
 
 세션 관리 메모:
 
+- 세션 메뉴의 `이름 변경`을 누르면 다음 일반 메시지로 새 세션 이름을 보낼 수 있습니다.
+- 이렇게 바꾼 이름은 Telegram 세션 목록과 Codex 쪽 세션 이름 소스에 함께 반영되도록 구현되어 있습니다.
 - 세션 메뉴의 `현재 세션 종료`는 터미널 `codex`의 `/exit`와 같은 의미로 active 세션만 닫고 기록은 유지합니다.
 - 세션 메뉴의 `현재 세션 삭제`는 active 세션을 archive 처리합니다.
 

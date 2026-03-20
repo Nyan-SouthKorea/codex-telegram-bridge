@@ -13,6 +13,12 @@ scripts/install_user_service.sh
 - conda base는 서비스 런타임으로 사용하지 않음
 - 오래된 `telegram-codex-relay.service`는 현재 운영 대상이 아니며 제거하는 것을 기준으로 함
 
+## 운영 판단 원칙
+
+- 같은 `bot_token`으로 foreground bot과 `systemd --user` 서비스를 동시에 띄우지 않습니다.
+- 서비스 상태는 과거 메모나 오래된 로그가 아니라, 현재 `systemctl --user status`와 `journalctl` 출력으로 판단합니다.
+- 재시작이나 중지 여부를 설명할 때도 실제 현재 상태를 다시 확인한 뒤 기록합니다.
+
 ## 부팅 후 자동 시작
 
 현재 권장 운영 방식은 `systemd --user + linger` 입니다.

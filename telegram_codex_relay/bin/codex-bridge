@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -561,12 +561,21 @@ def session_title_for_cwd(cwd: str) -> str:
 
 
 def retitle_thread(thread_id: str, title: str) -> None:
+    now = int(time.time())
     with open_state_db() as conn:
         conn.execute(
             "update threads set title = ?, updated_at = ? where id = ?",
-            (title, int(time.time()), thread_id),
+            (title, now, thread_id),
         )
         conn.commit()
+    SESSION_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": thread_id,
+        "thread_name": title,
+        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    with SESSION_INDEX_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def archive_thread(thread_id: str) -> None:
@@ -863,6 +872,35 @@ def cmd_close_session(state: dict[str, Any]) -> str:
     )
 
 
+def cmd_rename_session(state: dict[str, Any], selector: str | None, name_arg: str | None) -> str:
+    threads = sync_state_to_threads(state)
+    store_last_list(state, threads)
+    new_name = str(name_arg or "").strip()
+    if not new_name:
+        raise RuntimeError("새 세션 이름이 비어 있습니다.")
+    if "\n" in new_name or "\r" in new_name:
+        raise RuntimeError("세션 이름은 한 줄로 입력하세요.")
+    active_id = str(state.get("active_session_id") or "").strip()
+    target: ThreadEntry | None
+    if selector and selector.strip():
+        target = resolve_selector(state, threads, selector)
+    elif active_id:
+        target = get_thread(active_id)
+    else:
+        target = None
+    if not target:
+        return "현재 이름을 변경할 Codex 세션이 없습니다."
+    retitle_thread(target.id, new_name)
+    renamed = get_thread(target.id)
+    if state.get("active_session_id") == target.id:
+        state["active_session_name"] = new_name
+    if state.get("last_execution_session_id") == target.id:
+        state["last_execution_session_name"] = new_name
+    save_state(state)
+    final_name = renamed.title if renamed else new_name
+    return f"Codex 세션 이름을 변경했습니다.\n- id: {target.id}\n- name: {final_name}\n- cwd: {target.cwd}"
+
+
 def cmd_delete_session(state: dict[str, Any], selector: str | None) -> str:
     threads = sync_state_to_threads(state)
     store_last_list(state, threads)
@@ -1039,6 +1077,7 @@ def cmd_commands() -> str:
             "- /set-workdir <cwd>: /resume 목록 기준 디렉토리 변경",
             "- /fast: Codex Fast mode 토글",
             "- /new-session <cwd>: 지정한 폴더로 새 Codex 세션 생성",
+            "- /rename-session <session-id> <name>: Codex 세션 이름 변경",
             "- /close-session: 현재 active Codex 세션 종료 (/exit와 동일하게 기록은 유지)",
             "- /delete-session: 현재 active Codex 세션 삭제",
             "- /read: 최근 Codex 기록 읽기",
@@ -1087,6 +1126,17 @@ def main() -> int:
         if command == "new-session":
             selector = " ".join(args[1:]).strip() if len(args) > 1 else None
             print(cmd_new_session(state, selector))
+            return 0
+        if command == "rename-session":
+            if len(args) <= 1:
+                raise RuntimeError("변경할 세션 이름이 필요합니다.")
+            if len(args) == 2:
+                selector = None
+                name_arg = args[1]
+            else:
+                selector = args[1]
+                name_arg = " ".join(args[2:]).strip()
+            print(cmd_rename_session(state, selector, name_arg))
             return 0
         if command == "close-session":
             print(cmd_close_session(state))

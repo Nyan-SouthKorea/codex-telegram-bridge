@@ -10,8 +10,9 @@
 
 시작 순서:
 
-1. [docs/README.md](docs/README.md)
-2. [docs/setup/telegram.md](docs/setup/telegram.md)
-3. [docs/setup/install.md](docs/setup/install.md)
+1. [AGENTS.md](AGENTS.md)
+2. [docs/README.md](docs/README.md)
+3. [docs/setup/telegram.md](docs/setup/telegram.md)
+4. [docs/setup/install.md](docs/setup/install.md)
 
 현재 기능, 현재 제약, 현재 검증 상태는 [docs/status.md](docs/status.md)만 기준으로 봅니다.

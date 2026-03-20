@@ -45,6 +45,11 @@ class FakeApi:
 
 class SimulatedBot(DirectTelegramCodexBot):
     def __init__(self, tmpdir: Path):
+        self.fake_session_names = {
+            "sess-active": "Primary Session",
+            "sess-2": "Second Session",
+            "sess-3": "Nested Session",
+        }
         self.fake_state = {
             "workdir": str(tmpdir),
             "session_scope_cwd": str(tmpdir),
@@ -53,9 +58,9 @@ class SimulatedBot(DirectTelegramCodexBot):
             "fast_mode": False,
             "permission": "full",
             "active_session_id": "sess-active",
-            "active_session_name": "Primary Session",
+            "active_session_name": self.fake_session_names["sess-active"],
             "last_execution_session_id": "sess-active",
-            "last_execution_session_name": "Primary Session",
+            "last_execution_session_name": self.fake_session_names["sess-active"],
         }
         self.bridge_calls = []
         self.prompt_calls = []
@@ -84,7 +89,7 @@ class SimulatedBot(DirectTelegramCodexBot):
             sessions = [
                 {
                     "id": "sess-active",
-                    "name": "Primary Session",
+                    "name": self.fake_session_names["sess-active"],
                     "cwd": str(Path(self.config.workdir) / "project-a"),
                     "createdAt": 101,
                     "updatedAt": 111,
@@ -92,7 +97,7 @@ class SimulatedBot(DirectTelegramCodexBot):
                 },
                 {
                     "id": "sess-2",
-                    "name": "Second Session",
+                    "name": self.fake_session_names["sess-2"],
                     "cwd": str(Path(self.config.workdir) / "project-b"),
                     "createdAt": 100,
                     "updatedAt": 110,
@@ -100,7 +105,7 @@ class SimulatedBot(DirectTelegramCodexBot):
                 },
                 {
                     "id": "sess-3",
-                    "name": "Nested Session",
+                    "name": self.fake_session_names["sess-3"],
                     "cwd": str(Path(self.config.workdir) / "project-a" / "nested"),
                     "createdAt": 99,
                     "updatedAt": 109,
@@ -127,14 +132,29 @@ class SimulatedBot(DirectTelegramCodexBot):
             return "최근 Codex 출력:\n[1]\nhello"
         if args[:2] == ["resume", "sess-2"]:
             self.fake_state["active_session_id"] = "sess-2"
-            self.fake_state["active_session_name"] = "Second Session"
+            self.fake_state["active_session_name"] = self.fake_session_names["sess-2"]
             self.fake_state["workdir"] = str(Path(self.config.workdir) / "project-b")
-            return "Codex 세션을 전환했습니다.\n- id: sess-2\n- name: Second Session\n- cwd: /tmp/project-b"
+            return f"Codex 세션을 전환했습니다.\n- id: sess-2\n- name: {self.fake_session_names['sess-2']}\n- cwd: /tmp/project-b"
         if args[:1] == ["new-session"]:
+            self.fake_session_names["sess-new"] = "[tg] ~/new-project"
             self.fake_state["active_session_id"] = "sess-new"
-            self.fake_state["active_session_name"] = "[tg] ~/new-project"
+            self.fake_state["active_session_name"] = self.fake_session_names["sess-new"]
             self.fake_state["workdir"] = args[1]
-            return f"Codex 새 세션을 만들었습니다.\n- id: sess-new\n- cwd: {args[1]}\n- title: [tg] ~/new-project"
+            return f"Codex 새 세션을 만들었습니다.\n- id: sess-new\n- cwd: {args[1]}\n- title: {self.fake_session_names['sess-new']}"
+        if args[:1] == ["rename-session"]:
+            session_id = args[1]
+            new_name = args[2]
+            self.fake_session_names[session_id] = new_name
+            if self.fake_state.get("active_session_id") == session_id:
+                self.fake_state["active_session_name"] = new_name
+            if self.fake_state.get("last_execution_session_id") == session_id:
+                self.fake_state["last_execution_session_name"] = new_name
+            return (
+                "Codex 세션 이름을 변경했습니다.\n"
+                f"- id: {session_id}\n"
+                f"- name: {new_name}\n"
+                f"- cwd: {self.fake_state.get('workdir')}"
+            )
         if args[:1] == ["close-session"]:
             active_id = self.fake_state.get("active_session_id")
             active_name = self.fake_state.get("active_session_name")
@@ -224,7 +244,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertEqual(sent["inline_keyboard"][1][0]["text"], "Fast")
         self.assertIn("현재 Fast mode: off", sent["text"])
 
-    def test_resume_menu_includes_close_and_delete_buttons(self):
+    def test_resume_menu_includes_rename_close_and_delete_buttons(self):
         self.bot.fake_state["session_scope_cwd"] = str(Path(self.bot.config.workdir) / "project-a")
         self.bot.write_runtime_state(session_scope_initialized=True, session_scope_user_selected=True)
         text, buttons = self.bot.build_resume_menu()
@@ -234,9 +254,10 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertIn(str(Path(self.bot.config.workdir) / "project-a"), text)
         self.assertEqual(buttons[0][0]["text"], "디렉토리 설정")
         self.assertEqual(buttons[0][1]["text"], "새 세션 만들기")
-        self.assertEqual(buttons[1][0]["text"], "현재 세션 종료")
-        self.assertEqual(buttons[1][1]["text"], "현재 세션 삭제")
-        self.assertIn("Primary Session", buttons[2][0]["text"])
+        self.assertEqual(buttons[1][0]["text"], "이름 변경")
+        self.assertEqual(buttons[1][1]["text"], "현재 세션 종료")
+        self.assertEqual(buttons[2][0]["text"], "현재 세션 삭제")
+        self.assertIn("Primary Session", buttons[3][0]["text"])
 
     def test_resume_menu_filters_sessions_by_current_directory(self):
         self.bot.fake_state["session_scope_cwd"] = str(Path(self.bot.config.workdir) / "project-a")
@@ -451,6 +472,32 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertIn("relay> delete-session", self.bot.api.sent[0]["text"])
         self.assertIn("현재 Codex 세션을 삭제했습니다.", self.bot.api.sent[0]["text"])
 
+    def test_session_rename_button_requests_next_message(self):
+        self.bot.handle_callback(
+            {
+                "id": "cb-rename",
+                "data": "tgbtn:session:rename",
+                "message": {"chat": {"id": 111111111}},
+            }
+        )
+        self.assertEqual(self.bot.pending_session_rename(), ("sess-active", "Primary Session"))
+        self.assertIn("새 세션 이름을 다음 메시지로 보내세요.", self.bot.api.sent[0]["text"])
+        self.assertIn("세션 이름 변경 입력 대기 중", self.bot.api.sent[1]["text"])
+        self.assertEqual(self.bot.api.answered[-1]["text"], "새 이름 입력 대기")
+
+    def test_pending_session_rename_message_updates_session_name(self):
+        self.bot.fake_state["session_scope_cwd"] = str(Path(self.bot.config.workdir) / "project-a")
+        self.bot.write_runtime_state(session_scope_initialized=True, session_scope_user_selected=True)
+        self.bot.set_pending_session_rename("sess-active", "Primary Session")
+        self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 84, "text": "Telegram Renamed Session"})
+        self.assertEqual(self.bot.bridge_calls[0]["args"], ["rename-session", "sess-active", "Telegram Renamed Session"])
+        self.assertEqual(self.bot.pending_session_rename(), (None, None))
+        self.assertEqual(self.bot.fake_state["active_session_name"], "Telegram Renamed Session")
+        self.assertEqual(self.bot.fake_state["last_execution_session_name"], "Telegram Renamed Session")
+        self.assertIn("relay> rename-session", self.bot.api.sent[0]["text"])
+        self.assertIn("Codex 세션 이름을 변경했습니다.", self.bot.api.sent[0]["text"])
+        self.assertIn("Telegram Renamed Session", self.bot.api.sent[1]["text"])
+
     def test_session_close_closes_current_active_session_without_archiving(self):
         self.bot.fake_state["session_scope_cwd"] = str(Path(self.bot.config.workdir) / "project-a")
         self.bot.write_runtime_state(session_scope_initialized=True, session_scope_user_selected=True)
@@ -588,6 +635,44 @@ class CodexBridgeUnitTests(unittest.TestCase):
         self.assertIn("현재 Codex 세션을 종료했습니다.", output)
         self.assertIn("세션 기록은 유지되며 나중에 다시 이어서 열 수 있습니다.", output)
         save_state.assert_called_once_with(state)
+
+    def test_cmd_rename_session_updates_db_session_index_and_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            db_path = tmpdir_path / "state.sqlite"
+            state_path = tmpdir_path / "bridge_state.json"
+            session_index_path = tmpdir_path / "session_index.jsonl"
+            thread_id = "019d096c-7476-7b53-ae4e-faec75f9231d"
+            self.create_state_db(db_path, thread_id=thread_id, title="Original Title", updated_at=100)
+            state = {
+                "active_session_id": thread_id,
+                "active_session_name": "Original Title",
+                "last_execution_session_id": thread_id,
+                "last_execution_session_name": "Original Title",
+                "workdir": "/tmp/project-a",
+                "session_scope_cwd": "/tmp/project-a",
+                "last_list": [],
+            }
+
+            with patch.object(bridge, "STATE_PATH", state_path), patch.object(bridge, "SESSION_INDEX_PATH", session_index_path), patch.object(
+                bridge, "state_db_path", return_value=db_path
+            ):
+                output = bridge.cmd_rename_session(state, thread_id, "Renamed From Telegram")
+                payload = json.loads(bridge.cmd_sessions_json(state, "5", "/tmp/project-a"))
+
+            self.assertIn("Codex 세션 이름을 변경했습니다.", output)
+            self.assertEqual(state["active_session_name"], "Renamed From Telegram")
+            self.assertEqual(state["last_execution_session_name"], "Renamed From Telegram")
+            self.assertEqual(payload[0]["name"], "Renamed From Telegram")
+            session_index_lines = session_index_path.read_text(encoding="utf-8").strip().splitlines()
+            self.assertTrue(session_index_lines)
+            last_entry = json.loads(session_index_lines[-1])
+            self.assertEqual(last_entry["id"], thread_id)
+            self.assertEqual(last_entry["thread_name"], "Renamed From Telegram")
+            conn = sqlite3.connect(db_path)
+            row = conn.execute("select title from threads where id = ?", (thread_id,)).fetchone()
+            conn.close()
+            self.assertEqual(row[0], "Renamed From Telegram")
 
     def test_current_scope_cwd_uses_separate_scope_field(self):
         state = {"workdir": "/tmp/active", "session_scope_cwd": "/tmp/scope"}

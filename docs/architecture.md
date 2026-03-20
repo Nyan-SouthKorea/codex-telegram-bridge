@@ -16,7 +16,7 @@
 - [telegram_bot.py](../telegram_codex_relay/telegram_bot.py)
   Telegram polling, 버튼 렌더링, 현재 실행 취소, prompt 비동기 처리
 - [codex-bridge](../telegram_codex_relay/bin/codex-bridge)
-  세션 목록, 세션 전환, 새 세션 생성, 현재 세션 종료, 세션 archive 삭제, 모델/권한/thinking 저장, 상태 조회
+  세션 목록, 세션 전환, 새 세션 생성, 세션 이름 변경, 현재 세션 종료, 세션 archive 삭제, 모델/권한/thinking 저장, 상태 조회
 - `telegram_codex_relay/state/`
   브리지 상태와 런타임 상태 저장
 - `~/.codex`
@@ -37,6 +37,8 @@
   isolated one-turn exec 방식
 - `현재 세션 종료`
   active 세션 포인터만 해제하고 기록은 유지하며, 다음 평문은 새 active 세션으로 시작
+- `이름 변경`
+  Telegram에서 받은 새 이름을 Codex state DB와 `session_index.jsonl`에 함께 기록해 세션 표시명을 맞춤
 
 ## 컨텍스트 잔량
 
