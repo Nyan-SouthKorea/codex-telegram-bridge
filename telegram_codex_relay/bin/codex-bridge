@@ -149,16 +149,43 @@ def open_state_db() -> sqlite3.Connection:
     return conn
 
 
-def list_threads(limit: int = 20, cwd_filter: str | None = None) -> list[ThreadEntry]:
+def normalized_dir_string(value: str | Path | None) -> str | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return str(Path(raw).expanduser().resolve())
+    except Exception:
+        return str(Path(raw).expanduser())
+
+
+def subtree_like_pattern(path_value: str) -> str:
+    if path_value == "/":
+        return "/%"
+    return f"{path_value.rstrip('/')}/%"
+
+
+def current_scope_cwd(state: dict[str, Any]) -> str:
+    return normalized_dir_string(state.get("workdir")) or str(WORKDIR)
+
+
+def list_threads(limit: int = 20, cwd_filter: str | None = None, recursive: bool = False) -> list[ThreadEntry]:
     query = """
         select id, title, cwd, created_at, updated_at, rollout_path, sandbox_policy, approval_mode, model_provider, cli_version
         from threads
         where archived = 0
     """
     params: list[Any] = []
-    if cwd_filter:
-        query += " and cwd = ?"
-        params.append(cwd_filter)
+    normalized_filter = normalized_dir_string(cwd_filter)
+    if normalized_filter:
+        if recursive:
+            query += " and (cwd = ? or cwd like ?)"
+            params.extend([normalized_filter, subtree_like_pattern(normalized_filter)])
+        else:
+            query += " and cwd = ?"
+            params.append(normalized_filter)
     query += " order by updated_at desc, created_at desc limit ?"
     params.append(max(limit, 1))
     with open_state_db() as conn:
@@ -222,6 +249,11 @@ def sync_state_to_threads(state: dict[str, Any]) -> list[ThreadEntry]:
                 state["active_session_name"] = None
     save_state(state)
     return threads
+
+
+def scope_threads(state: dict[str, Any], limit: int = 20, cwd_override: str | None = None) -> list[ThreadEntry]:
+    scope = normalized_dir_string(cwd_override) or current_scope_cwd(state)
+    return list_threads(limit=max(limit, 1), cwd_filter=scope, recursive=True)
 
 
 def permission_mode(value: str | None) -> str:
@@ -572,22 +604,24 @@ def resolve_selector(state: dict[str, Any], threads: list[ThreadEntry], selector
     return next((entry for entry in threads if lowered in entry.title.lower()), None)
 
 
-def cmd_sessions(state: dict[str, Any], limit_arg: str | None) -> str:
+def cmd_sessions(state: dict[str, Any], limit_arg: str | None, cwd_arg: str | None = None) -> str:
     try:
         limit = int(limit_arg) if limit_arg else 8
     except ValueError:
         limit = 8
-    threads = sync_state_to_threads(state)
+    sync_state_to_threads(state)
+    threads = scope_threads(state, limit=max(limit, 20), cwd_override=cwd_arg)
     store_last_list(state, threads)
     return format_sessions(threads, limit)
 
 
-def cmd_sessions_json(state: dict[str, Any], limit_arg: str | None) -> str:
+def cmd_sessions_json(state: dict[str, Any], limit_arg: str | None, cwd_arg: str | None = None) -> str:
     try:
         limit = int(limit_arg) if limit_arg else 8
     except ValueError:
         limit = 8
-    threads = sync_state_to_threads(state)
+    sync_state_to_threads(state)
+    threads = scope_threads(state, limit=max(limit, 20), cwd_override=cwd_arg)
     store_last_list(state, threads)
     active_id = str(state.get("active_session_id") or "").strip()
     payload = [
@@ -605,7 +639,8 @@ def cmd_sessions_json(state: dict[str, Any], limit_arg: str | None) -> str:
 
 
 def cmd_resume(state: dict[str, Any], selector: str | None) -> str:
-    threads = sync_state_to_threads(state)
+    sync_state_to_threads(state)
+    threads = scope_threads(state, limit=20)
     store_last_list(state, threads)
     if not selector:
         return format_sessions(threads, 8)
@@ -617,6 +652,25 @@ def cmd_resume(state: dict[str, Any], selector: str | None) -> str:
     state["workdir"] = target.cwd
     save_state(state)
     return f"Codex 세션을 전환했습니다.\n- id: {target.id}\n- name: {target.title}\n- cwd: {target.cwd}"
+
+
+def cmd_set_workdir(state: dict[str, Any], cwd_arg: str | None) -> str:
+    raw = str(cwd_arg or "").strip()
+    if not raw:
+        return f"현재 디렉토리: {current_scope_cwd(state)}"
+    target = Path(raw).expanduser()
+    if not target.exists():
+        raise RuntimeError(f"디렉터리를 찾지 못했습니다: {target}")
+    if not target.is_dir():
+        raise RuntimeError(f"폴더가 아닙니다: {target}")
+    normalized = str(target.resolve())
+    state["workdir"] = normalized
+    save_state(state)
+    return (
+        "현재 디렉토리를 저장했습니다.\n"
+        f"- cwd: {normalized}\n"
+        "- /resume 목록은 이 폴더와 하위 폴더 기준으로 표시됩니다."
+    )
 
 
 def cmd_new_session(state: dict[str, Any], cwd_arg: str | None) -> str:
@@ -722,6 +776,7 @@ def cmd_status(state: dict[str, Any]) -> str:
         f"- activeSessionId: {active_id or '-'}",
         f"- activeSessionName: {state.get('active_session_name') or '-'}",
         f"- activeSessionCwd: {active_thread.cwd if active_thread else state.get('workdir') or '-'}",
+        f"- sessionScopeCwd: {current_scope_cwd(state)}",
         f"- activeSessionCreatedAt: {active_thread.created_at if active_thread else '-'}",
         f"- activeSessionUpdatedAt: {active_thread.updated_at if active_thread else '-'}",
         f"- lastExecutionSessionId: {execution_id or '-'}",
@@ -826,7 +881,8 @@ def cmd_commands() -> str:
             "사용 가능한 브리지 명령:",
             "- plain text: 활성 Codex 세션으로 전달",
             "- /help: 텔레그램 버튼 메뉴와 사용법 표시",
-            "- /resume: 세션 메뉴와 최근 Codex 세션 버튼 표시",
+            "- /resume: 현재 디렉토리와 하위 폴더 기준 세션 메뉴 표시",
+            "- /set-workdir <cwd>: /resume 목록 기준 디렉토리 변경",
             "- /new-session <cwd>: 지정한 폴더로 새 Codex 세션 생성",
             "- /delete-session: 현재 active Codex 세션 삭제",
             "- /read: 최근 Codex 기록 읽기",
@@ -855,14 +911,22 @@ def main() -> int:
             print(run_prompt(state, text))
             return 0
         if command == "sessions":
-            print(cmd_sessions(state, args[1] if len(args) > 1 else None))
+            limit_arg = args[1] if len(args) > 1 else None
+            cwd_arg = " ".join(args[2:]).strip() if len(args) > 2 else None
+            print(cmd_sessions(state, limit_arg, cwd_arg))
             return 0
         if command == "sessions-json":
-            print(cmd_sessions_json(state, args[1] if len(args) > 1 else None))
+            limit_arg = args[1] if len(args) > 1 else None
+            cwd_arg = " ".join(args[2:]).strip() if len(args) > 2 else None
+            print(cmd_sessions_json(state, limit_arg, cwd_arg))
             return 0
         if command == "resume":
             selector = " ".join(args[1:]).strip() if len(args) > 1 else None
             print(cmd_resume(state, selector))
+            return 0
+        if command in {"set-workdir", "workdir", "cwd"}:
+            selector = " ".join(args[1:]).strip() if len(args) > 1 else None
+            print(cmd_set_workdir(state, selector))
             return 0
         if command == "new-session":
             selector = " ".join(args[1:]).strip() if len(args) > 1 else None

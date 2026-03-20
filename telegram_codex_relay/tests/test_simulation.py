@@ -72,27 +72,41 @@ class SimulatedBot(DirectTelegramCodexBot):
     def run_bridge(self, args, stdin_text=None, timeout_ms=25_000):
         self.bridge_calls.append({"args": list(args), "stdin_text": stdin_text})
         if args[:1] == ["sessions-json"]:
-            return json.dumps(
-                [
-                    {
-                        "id": "sess-active",
-                        "name": "Primary Session",
-                        "cwd": str(Path(self.config.workdir) / "project-a"),
-                        "createdAt": 101,
-                        "updatedAt": 111,
-                        "active": True,
-                    },
-                    {
-                        "id": "sess-2",
-                        "name": "Second Session",
-                        "cwd": str(Path(self.config.workdir) / "project-b"),
-                        "createdAt": 100,
-                        "updatedAt": 110,
-                        "active": False,
-                    },
-                ],
-                ensure_ascii=False,
-            )
+            sessions = [
+                {
+                    "id": "sess-active",
+                    "name": "Primary Session",
+                    "cwd": str(Path(self.config.workdir) / "project-a"),
+                    "createdAt": 101,
+                    "updatedAt": 111,
+                    "active": True,
+                },
+                {
+                    "id": "sess-2",
+                    "name": "Second Session",
+                    "cwd": str(Path(self.config.workdir) / "project-b"),
+                    "createdAt": 100,
+                    "updatedAt": 110,
+                    "active": False,
+                },
+                {
+                    "id": "sess-3",
+                    "name": "Nested Session",
+                    "cwd": str(Path(self.config.workdir) / "project-a" / "nested"),
+                    "createdAt": 99,
+                    "updatedAt": 109,
+                    "active": False,
+                },
+            ]
+            if len(args) >= 3:
+                scope = str(Path(args[2]).resolve())
+                prefix = scope if scope == "/" else f"{scope.rstrip('/')}/"
+                sessions = [
+                    session
+                    for session in sessions
+                    if str(Path(session["cwd"]).resolve()) == scope or str(Path(session["cwd"]).resolve()).startswith(prefix)
+                ]
+            return json.dumps(sessions, ensure_ascii=False)
         if args[:1] == ["status"]:
             return "Codex relay 상태:\n- activeSessionId: sess-active"
         if args[:1] == ["read"]:
@@ -107,6 +121,13 @@ class SimulatedBot(DirectTelegramCodexBot):
             self.fake_state["active_session_name"] = "[tg] ~/new-project"
             self.fake_state["workdir"] = args[1]
             return f"Codex 새 세션을 만들었습니다.\n- id: sess-new\n- cwd: {args[1]}\n- title: [tg] ~/new-project"
+        if args[:1] == ["set-workdir"]:
+            self.fake_state["workdir"] = args[1]
+            return (
+                "현재 디렉토리를 저장했습니다.\n"
+                f"- cwd: {args[1]}\n"
+                "- /resume 목록은 이 폴더와 하위 폴더 기준으로 표시됩니다."
+            )
         if args[:1] == ["delete-session"]:
             self.fake_state["active_session_id"] = None
             self.fake_state["active_session_name"] = None
@@ -153,6 +174,8 @@ class TelegramRelaySimulationTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir_ctx = tempfile.TemporaryDirectory()
         self.tmpdir = Path(self.tmpdir_ctx.name)
+        (self.tmpdir / "project-a" / "nested").mkdir(parents=True, exist_ok=True)
+        (self.tmpdir / "project-b").mkdir(parents=True, exist_ok=True)
         self.bot = SimulatedBot(self.tmpdir)
 
     def tearDown(self):
@@ -170,10 +193,21 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 11, "text": "/resume"})
         sent = self.bot.api.sent[-1]
         self.assertIn("Codex 세션", sent["text"])
+        self.assertIn("세션 기준 폴더:", sent["text"])
         self.assertIn("created:", sent["text"])
         self.assertIn(str(Path(self.bot.config.workdir) / "project-a"), sent["text"])
-        self.assertEqual(sent["inline_keyboard"][0][0]["text"], "새 세션 만들기")
-        self.assertEqual(sent["inline_keyboard"][0][1]["text"], "현재 세션 삭제")
+        self.assertEqual(sent["inline_keyboard"][0][0]["text"], "디렉토리 설정")
+        self.assertEqual(sent["inline_keyboard"][0][1]["text"], "새 세션 만들기")
+        self.assertEqual(sent["inline_keyboard"][1][0]["text"], "현재 세션 삭제")
+
+    def test_resume_menu_filters_sessions_by_current_directory(self):
+        self.bot.fake_state["workdir"] = str(Path(self.bot.config.workdir) / "project-a")
+        self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 12, "text": "/resume"})
+        sent = self.bot.api.sent[-1]
+        self.assertIn(str(Path(self.bot.config.workdir) / "project-a"), sent["text"])
+        self.assertIn(str(Path(self.bot.config.workdir) / "project-a" / "nested"), sent["text"])
+        self.assertNotIn(str(Path(self.bot.config.workdir) / "project-b"), sent["text"])
+        self.assertEqual(self.bot.bridge_calls[0]["args"], ["sessions-json", "12", str(Path(self.bot.config.workdir) / "project-a")])
 
     def test_model_callback_sets_model_and_opens_thinking_menu(self):
         self.bot.handle_callback(
@@ -273,6 +307,33 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertIn("../", labels)
         self.assertIn("현재 폴더로 세션 시작", labels)
         self.assertIn("새 폴더 만들기", labels)
+
+    def test_resume_browser_shows_directory_and_session_preview(self):
+        browser_root = self.tmpdir / "project-a"
+        (browser_root / "nested").mkdir(parents=True, exist_ok=True)
+        self.bot.write_runtime_state(resume_browser_path=str(browser_root), resume_browser_page=0, resume_browser_token="token-r")
+        text, buttons = self.bot.build_resume_browser_menu()
+        self.assertIn("세션 디렉토리 선택", text)
+        self.assertIn("현재 /resume 기준 폴더", text)
+        self.assertIn("Primary Session", text)
+        self.assertIn("Nested Session", text)
+        labels = [button["text"] for row in buttons for button in row]
+        self.assertIn("이 폴더를 현재 디렉토리로 설정", labels)
+
+    def test_resume_browser_set_updates_current_directory(self):
+        target = self.tmpdir / "project-b"
+        target.mkdir(parents=True, exist_ok=True)
+        self.bot.write_runtime_state(resume_browser_path=str(target), resume_browser_page=0, resume_browser_token="token-r")
+        self.bot.handle_callback(
+            {
+                "id": "cb-r1",
+                "data": "tgbtn:resbrowse:set|token-r",
+                "message": {"chat": {"id": 111111111}},
+            }
+        )
+        self.assertEqual(self.bot.bridge_calls[0]["args"], ["set-workdir", str(target)])
+        self.assertIn("현재 디렉토리를 저장했습니다.", self.bot.api.sent[0]["text"])
+        self.assertIn("세션 기준 폴더:", self.bot.api.sent[1]["text"])
 
     def test_new_folder_message_creates_directory_and_session(self):
         parent = self.tmpdir / "parent"

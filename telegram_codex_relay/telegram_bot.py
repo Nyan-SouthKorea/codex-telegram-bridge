@@ -288,24 +288,53 @@ class DirectTelegramCodexBot:
         except Exception:
             return {"status": "idle"}
 
+    def safe_directory(self, raw_path: str | Path | None, fallback: Path) -> Path:
+        try:
+            candidate = Path(raw_path or fallback).expanduser().resolve()
+        except Exception:
+            candidate = fallback
+        if not candidate.exists() or not candidate.is_dir():
+            return fallback
+        return candidate
+
     def session_browser_root(self) -> Path:
         return Path.home()
 
-    def session_browser_state(self) -> tuple[Path, int, str]:
+    def current_scope_path(self) -> Path:
+        state = self.load_bridge_state()
+        fallback = self.safe_directory(self.config.workdir, Path.home())
+        return self.safe_directory(state.get("workdir"), fallback)
+
+    def browser_state(self, path_key: str, page_key: str, token_key: str, fallback: Path) -> tuple[Path, int, str]:
         data = self.load_runtime_state()
-        raw_path = str(data.get("session_browser_path") or self.session_browser_root())
+        raw_path = str(data.get(path_key) or fallback)
+        path = self.safe_directory(raw_path, fallback)
         try:
-            path = Path(raw_path).expanduser().resolve()
-        except Exception:
-            path = self.session_browser_root()
-        if not path.exists() or not path.is_dir():
-            path = self.session_browser_root()
-        try:
-            page = max(int(data.get("session_browser_page") or 0), 0)
+            page = max(int(data.get(page_key) or 0), 0)
         except Exception:
             page = 0
-        token = str(data.get("session_browser_token") or "")
+        token = str(data.get(token_key) or "")
         return path, page, token
+
+    def set_browser_state(self, path_key: str, page_key: str, token_key: str, path: Path, page: int = 0) -> str:
+        normalized = path.expanduser().resolve()
+        token = str(int(time.time() * 1000))
+        self.write_runtime_state(
+            **{
+                path_key: str(normalized),
+                page_key: max(page, 0),
+                token_key: token,
+            }
+        )
+        return token
+
+    def session_browser_state(self) -> tuple[Path, int, str]:
+        return self.browser_state(
+            "session_browser_path",
+            "session_browser_page",
+            "session_browser_token",
+            self.session_browser_root(),
+        )
 
     def pending_new_folder_parent(self) -> Path | None:
         data = self.load_runtime_state()
@@ -325,14 +354,30 @@ class DirectTelegramCodexBot:
         self.write_runtime_state(pending_new_folder_parent=str(path.expanduser().resolve()))
 
     def set_session_browser_state(self, path: Path, page: int = 0) -> str:
-        normalized = path.expanduser().resolve()
-        token = str(int(time.time() * 1000))
-        self.write_runtime_state(
-            session_browser_path=str(normalized),
-            session_browser_page=max(page, 0),
-            session_browser_token=token,
+        return self.set_browser_state(
+            "session_browser_path",
+            "session_browser_page",
+            "session_browser_token",
+            path,
+            page,
         )
-        return token
+
+    def resume_browser_state(self) -> tuple[Path, int, str]:
+        return self.browser_state(
+            "resume_browser_path",
+            "resume_browser_page",
+            "resume_browser_token",
+            self.current_scope_path(),
+        )
+
+    def set_resume_browser_state(self, path: Path, page: int = 0) -> str:
+        return self.set_browser_state(
+            "resume_browser_path",
+            "resume_browser_page",
+            "resume_browser_token",
+            path,
+            page,
+        )
 
     def list_browser_directories(self, path: Path) -> list[Path]:
         try:
@@ -392,6 +437,7 @@ class DirectTelegramCodexBot:
                 "- 평문은 현재 Codex 세션으로 바로 전달됩니다.",
                 "- 설정 변경은 버튼으로만 합니다.",
                 "- 권한이 full이면 지속 세션, read/deny면 격리 1회 실행입니다.",
+                "- 세션 메뉴의 `디렉토리 설정`으로 /resume 기준 폴더를 바꿀 수 있습니다.",
                 "- `Fast`는 속도 배수 모드가 아니라 `reasoning=low` 별칭입니다.",
                 "",
                 f"현재 모델: {format_state_value(state.get('model'))}",
@@ -422,27 +468,33 @@ class DirectTelegramCodexBot:
 
     def build_resume_menu(self) -> tuple[str, list[list[dict[str, str]]]]:
         state = self.load_bridge_state()
-        raw = self.run_bridge(["sessions-json", "12"])
+        scope_path = self.current_scope_path()
+        raw = self.run_bridge(["sessions-json", "12", str(scope_path)])
         entries = json.loads(raw)
         rows: list[list[dict[str, str]]] = []
         active_id = str(state.get("active_session_id") or "").strip()
-        current_cwd = str(state.get("workdir") or "-")
         text_lines = [
             "Codex 세션",
             f"현재 세션: {format_state_value(state.get('active_session_name'), '(none)')}",
-            f"현재 작업 폴더: {current_cwd}",
+            f"세션 기준 폴더: {scope_path}",
             "",
+            "표시 규칙: 이 폴더와 하위 폴더 세션만 보여줍니다.",
             "최근 세션 순서: 최신 활동 순",
             "",
         ]
         rows.append(
             [
+                {"text": "디렉토리 설정", "callback_data": button_data("menu", "resume-browser")},
                 {"text": "새 세션 만들기", "callback_data": button_data("menu", "session-browser")},
+            ]
+        )
+        rows.append(
+            [
                 {"text": "현재 세션 삭제", "callback_data": button_data("session", "delete")},
             ]
         )
         if not entries:
-            text_lines.append("- 사용 가능한 세션이 없습니다.")
+            text_lines.append("- 이 폴더와 하위 폴더에 세션이 없습니다.")
         for index, entry in enumerate(entries, start=1):
             active = bool(entry.get("active")) or str(entry.get("id") or "") == active_id
             text_lines.extend(self.format_session_entry_lines(index, entry, active))
@@ -462,6 +514,73 @@ class DirectTelegramCodexBot:
             ]
         )
         return "\n".join(text_lines), rows
+
+    def build_resume_browser_menu(self) -> tuple[str, list[list[dict[str, str]]]]:
+        path, page, _ = self.resume_browser_state()
+        scope_path = self.current_scope_path()
+        directories = self.list_browser_directories(path)
+        preview_raw = self.run_bridge(["sessions-json", "5", str(path)])
+        preview_entries = json.loads(preview_raw)
+        active_id = str(self.load_bridge_state().get("active_session_id") or "").strip()
+        page_count = max((len(directories) - 1) // SESSION_BROWSER_PAGE_SIZE + 1, 1)
+        page = min(page, page_count - 1)
+        token = self.set_resume_browser_state(path, page)
+        start = page * SESSION_BROWSER_PAGE_SIZE
+        visible = directories[start : start + SESSION_BROWSER_PAGE_SIZE]
+        text_lines = [
+            "세션 디렉토리 선택",
+            f"현재 폴더: {path}",
+            f"현재 /resume 기준 폴더: {scope_path}",
+            f"페이지: {page + 1}/{page_count}",
+            "",
+            "이 폴더를 현재 디렉토리로 설정하면 /resume 목록이 이 폴더와 하위 폴더 기준으로 바뀝니다.",
+        ]
+        rows: list[list[dict[str, str]]] = []
+        if visible:
+            text_lines.extend(["", "보이는 하위 폴더:"])
+        for index, entry in enumerate(visible, start=1):
+            text_lines.append(f"[{index}] {entry}")
+            rows.append(
+                [
+                    {
+                        "text": self.browser_button_label(index, entry),
+                        "callback_data": button_data("resbrowse", f"open|{token}|{index - 1}"),
+                    }
+                ]
+            )
+        if not visible:
+            text_lines.extend(["", "- 하위 폴더가 없습니다."])
+        text_lines.extend(["", "현재 폴더 기준 최근 세션 미리보기:"])
+        if preview_entries:
+            for index, entry in enumerate(preview_entries, start=1):
+                active = bool(entry.get("active")) or str(entry.get("id") or "") == active_id
+                text_lines.extend(self.format_session_entry_lines(index, entry, active))
+                text_lines.append("")
+        else:
+            text_lines.append("- 이 폴더와 하위 폴더에 세션이 없습니다.")
+        nav_row: list[dict[str, str]] = []
+        if path.parent != path:
+            nav_row.append({"text": "../", "callback_data": button_data("resbrowse", f"up|{token}")})
+        if page > 0:
+            nav_row.append({"text": "이전", "callback_data": button_data("resbrowse", f"page|{token}|{page - 1}")})
+        if page + 1 < page_count:
+            nav_row.append({"text": "다음", "callback_data": button_data("resbrowse", f"page|{token}|{page + 1}")})
+        if nav_row:
+            rows.append(nav_row)
+        set_label = "✓ 현재 디렉토리" if path == scope_path else "이 폴더를 현재 디렉토리로 설정"
+        rows.append(
+            [
+                {"text": set_label, "callback_data": button_data("resbrowse", f"set|{token}")},
+                {"text": "세션 메뉴", "callback_data": button_data("menu", "resume")},
+            ]
+        )
+        rows.append(
+            [
+                {"text": "도움말", "callback_data": button_data("menu", "help")},
+                {"text": "현재 상태", "callback_data": button_data("status")},
+            ]
+        )
+        return "\n".join(text_lines).strip(), rows
 
     def build_session_browser_menu(self) -> tuple[str, list[list[dict[str, str]]]]:
         path, page, _ = self.session_browser_state()
@@ -624,6 +743,8 @@ class DirectTelegramCodexBot:
             return self.build_help_menu()
         if kind == "resume":
             return self.build_resume_menu()
+        if kind == "resume-browser":
+            return self.build_resume_browser_menu()
         if kind == "session-browser":
             return self.build_session_browser_menu()
         if kind == "model":
@@ -858,6 +979,9 @@ class DirectTelegramCodexBot:
             notice = "세션 전환은 이제 버튼으로만 선택합니다." if args else None
             self.send_menu(chat_id, "resume", reply_to_message_id=message_id, notice=notice)
             return
+        if name in {"cwd", "workdir"}:
+            self.send_menu(chat_id, "resume-browser", reply_to_message_id=message_id, notice="현재 디렉토리 변경은 버튼으로만 선택합니다.")
+            return
         if name == "model":
             notice = "모델 변경은 이제 버튼으로만 선택합니다." if args else None
             self.send_menu(chat_id, "model", reply_to_message_id=message_id, notice=notice)
@@ -1022,6 +1146,54 @@ class DirectTelegramCodexBot:
                     self.api.answer_callback_query(callback_id, "새 세션 생성 완료")
                     return
                 self.api.answer_callback_query(callback_id, "지원하지 않는 세션 버튼입니다.")
+                return
+            if kind == "resbrowse" and value:
+                parts = value.split("|")
+                subaction = parts[0] if parts else ""
+                runtime = self.load_runtime_state()
+                current_token = str(runtime.get("resume_browser_token") or "")
+                current_path, current_page, _ = self.resume_browser_state()
+                if len(parts) < 2 or parts[1] != current_token:
+                    self.send_menu(chat_id, "resume-browser", notice="세션 디렉토리 브라우저가 갱신되었습니다. 다시 선택하세요.")
+                    self.api.answer_callback_query(callback_id, "브라우저를 새로고침했습니다.")
+                    return
+                if subaction == "up":
+                    self.set_resume_browser_state(current_path.parent if current_path.parent != current_path else current_path, 0)
+                    self.send_menu(chat_id, "resume-browser")
+                    self.api.answer_callback_query(callback_id)
+                    return
+                if subaction == "page" and len(parts) >= 3:
+                    try:
+                        target_page = max(int(parts[2]), 0)
+                    except ValueError:
+                        target_page = 0
+                    self.set_resume_browser_state(current_path, target_page)
+                    self.send_menu(chat_id, "resume-browser")
+                    self.api.answer_callback_query(callback_id)
+                    return
+                if subaction == "open" and len(parts) >= 3:
+                    try:
+                        index = int(parts[2])
+                    except ValueError:
+                        index = -1
+                    directories = self.list_browser_directories(current_path)
+                    start = current_page * SESSION_BROWSER_PAGE_SIZE
+                    visible = directories[start : start + SESSION_BROWSER_PAGE_SIZE]
+                    if not (0 <= index < len(visible)):
+                        self.send_menu(chat_id, "resume-browser", notice="선택한 폴더를 다시 골라주세요.")
+                        self.api.answer_callback_query(callback_id, "폴더 목록이 바뀌었습니다.")
+                        return
+                    self.set_resume_browser_state(visible[index], 0)
+                    self.send_menu(chat_id, "resume-browser")
+                    self.api.answer_callback_query(callback_id)
+                    return
+                if subaction == "set":
+                    output = self.run_bridge(["set-workdir", str(current_path)])
+                    self.api.send_message(chat_id, output)
+                    self.send_menu(chat_id, "resume")
+                    self.api.answer_callback_query(callback_id, "현재 디렉토리 설정 완료")
+                    return
+                self.api.answer_callback_query(callback_id, "지원하지 않는 세션 디렉토리 버튼입니다.")
                 return
             if kind == "model" and value:
                 output = self.run_bridge(["model", value])

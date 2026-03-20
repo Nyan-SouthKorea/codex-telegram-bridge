@@ -23,9 +23,16 @@
 - `Low (Fast)`는 `model_reasoning_effort=low` 별칭이며, 속도 2배 보장 모드는 아님
 - `/resume`은 세션 메뉴를 엶
 - 세션 메뉴에서:
+  - `디렉토리 설정`
   - 최근 세션 선택
   - `새 세션 만들기`
   - `현재 세션 삭제`
+- `/resume` 목록은 현재 디렉토리와 하위 폴더 세션만 표시
+- 세션 디렉토리 브라우저에서:
+  - 폴더 버튼으로 안쪽으로 이동
+  - `../` 버튼으로 상위 폴더 이동
+  - 현재 폴더 기준 최근 세션 미리보기 확인
+  - `이 폴더를 현재 디렉토리로 설정`
 - 세션 목록은 최신 활동 순으로 정렬
 - 세션 목록은 각 세션의 전체 `cwd`, 생성 시각, 수정 시각을 표시
 - 새 세션 만들기는 `~/`부터 폴더 브라우저를 열고, 현재 폴더의 바로 아래 하위 폴더만 보여줌
@@ -38,6 +45,7 @@
 - `/read`와 `최근 출력`은 현재 active 세션을 우선 기준으로 읽음
 - `/status`는 아래 값을 보여줌
   - active session id/name/cwd
+  - session scope cwd
   - permission
   - model
   - reasoning
@@ -89,10 +97,11 @@
 
 2026-03-20 로컬 검증 기준:
 
-- `scripts/run_tests.sh` 19개 통과
+- `scripts/run_tests.sh` 22개 통과
 - 새 레포 경로의 `codex-bridge`로 `new-session -> prompt -> delete-session` 실검증 완료
 - 새 레포 경로의 `codex-bridge`로 `resume -> read -> restore` 실검증 완료
 - 새 레포 경로의 `codex-bridge`로 `thinking fast -> reasoning low 저장 -> status 확인` 실검증 완료
+- 새 레포 경로의 `codex-bridge`로 `set-workdir -> status scope -> sessions-json filter -> restore` 실검증 완료
 - 기존 사용자 서비스 `telegram-codex-relay.service`는 중지했고, 현재는 `codex-telegram-bridge.service`가 새 레포 경로를 사용 중
 
 ## 비용과 외부 의존성
