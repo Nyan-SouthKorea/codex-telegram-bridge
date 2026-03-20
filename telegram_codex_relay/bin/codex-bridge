@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -77,13 +78,40 @@ def normalize_model_value(value: str | None) -> str | None:
     return MODEL_ALIASES.get(squashed, raw)
 
 
+def load_user_config_defaults() -> dict[str, Any]:
+    config_path = CODEX_HOME / "config.toml"
+    if not config_path.exists():
+        return {}
+    try:
+        return tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def default_fast_mode() -> bool:
+    config = load_user_config_defaults()
+    raw_fast = config.get("fast_mode")
+    if isinstance(raw_fast, bool):
+        return raw_fast
+    return str(config.get("service_tier") or "").strip().lower() == "fast"
+
+
+def fast_mode_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    lowered = str(value or "").strip().lower()
+    return lowered in {"1", "true", "on", "yes", "enabled", "fast"}
+
+
 def state_template() -> dict[str, Any]:
     return {
-        "version": 2,
+        "version": 3,
         "workdir": str(WORKDIR),
+        "session_scope_cwd": str(WORKDIR),
         "permission": "full",
         "model": "gpt-5.4",
         "reasoning_effort": "low",
+        "fast_mode": default_fast_mode(),
         "active_session_id": None,
         "active_session_name": None,
         "last_execution_session_id": None,
@@ -100,9 +128,11 @@ def load_state() -> dict[str, Any]:
             state.update(
                 {
                     "workdir": data.get("workdir") or state["workdir"],
+                    "session_scope_cwd": data.get("session_scope_cwd") or data.get("workdir") or state["session_scope_cwd"],
                     "permission": data.get("permission") or state["permission"],
                     "model": normalize_model_value(data.get("model")) or None,
                     "reasoning_effort": data.get("reasoning_effort") or state["reasoning_effort"],
+                    "fast_mode": fast_mode_enabled(data.get("fast_mode")),
                     "active_session_id": data.get("active_session_id"),
                     "active_session_name": data.get("active_session_name"),
                     "last_execution_session_id": data.get("last_execution_session_id") or data.get("active_session_id"),
@@ -168,7 +198,7 @@ def subtree_like_pattern(path_value: str) -> str:
 
 
 def current_scope_cwd(state: dict[str, Any]) -> str:
-    return normalized_dir_string(state.get("workdir")) or str(WORKDIR)
+    return normalized_dir_string(state.get("session_scope_cwd")) or normalized_dir_string(state.get("workdir")) or str(WORKDIR)
 
 
 def list_threads(limit: int = 20, cwd_filter: str | None = None, recursive: bool = False) -> list[ThreadEntry]:
@@ -253,7 +283,7 @@ def sync_state_to_threads(state: dict[str, Any]) -> list[ThreadEntry]:
 
 def scope_threads(state: dict[str, Any], limit: int = 20, cwd_override: str | None = None) -> list[ThreadEntry]:
     scope = normalized_dir_string(cwd_override) or current_scope_cwd(state)
-    return list_threads(limit=max(limit, 1), cwd_filter=scope, recursive=True)
+    return list_threads(limit=max(limit, 1), cwd_filter=scope, recursive=False)
 
 
 def permission_mode(value: str | None) -> str:
@@ -310,6 +340,7 @@ def command_prefix_for_state(state: dict[str, Any], *, resume: bool, permission_
     reasoning = reasoning_mode(state.get("reasoning_effort"))
     if reasoning:
         args.extend(["-c", f'model_reasoning_effort="{reasoning}"'])
+    args.extend(["-c", f'fast_mode={"true" if fast_mode_enabled(state.get("fast_mode")) else "false"}'])
     return args
 
 
@@ -664,12 +695,38 @@ def cmd_set_workdir(state: dict[str, Any], cwd_arg: str | None) -> str:
     if not target.is_dir():
         raise RuntimeError(f"폴더가 아닙니다: {target}")
     normalized = str(target.resolve())
-    state["workdir"] = normalized
+    state["session_scope_cwd"] = normalized
     save_state(state)
     return (
         "현재 디렉토리를 저장했습니다.\n"
         f"- cwd: {normalized}\n"
-        "- /resume 목록은 이 폴더와 하위 폴더 기준으로 표시됩니다."
+        "- /resume 목록은 이 폴더와 동일한 cwd 세션만 표시됩니다."
+    )
+
+
+def cmd_fast(state: dict[str, Any], value: str | None) -> str:
+    lowered = str(value or "").strip().lower()
+    current = fast_mode_enabled(state.get("fast_mode"))
+    if lowered in {"show", "status"}:
+        return f"현재 Codex Fast mode: {'on' if current else 'off'}"
+    if lowered in {"on", "enable", "enabled", "true", "1", "fast"}:
+        target = True
+    elif lowered in {"off", "disable", "disabled", "false", "0", "normal"}:
+        target = False
+    else:
+        target = not current
+    state["fast_mode"] = target
+    save_state(state)
+    if target:
+        return (
+            "Codex Fast mode를 켰습니다.\n"
+            "- fast_mode=true\n"
+            "- fastest inference at 2X plan usage"
+        )
+    return (
+        "Codex Fast mode를 껐습니다.\n"
+        "- fast_mode=false\n"
+        "- standard inference mode"
     )
 
 
@@ -777,6 +834,7 @@ def cmd_status(state: dict[str, Any]) -> str:
         f"- activeSessionName: {state.get('active_session_name') or '-'}",
         f"- activeSessionCwd: {active_thread.cwd if active_thread else state.get('workdir') or '-'}",
         f"- sessionScopeCwd: {current_scope_cwd(state)}",
+        f"- fastMode: {'on' if fast_mode_enabled(state.get('fast_mode')) else 'off'}",
         f"- activeSessionCreatedAt: {active_thread.created_at if active_thread else '-'}",
         f"- activeSessionUpdatedAt: {active_thread.updated_at if active_thread else '-'}",
         f"- lastExecutionSessionId: {execution_id or '-'}",
@@ -858,20 +916,15 @@ def cmd_thinking(state: dict[str, Any], value: str | None) -> str:
     if not value or value.strip().lower() in {"show", "status"}:
         return (
             f"현재 Codex thinking 오버라이드: {state.get('reasoning_effort') or '(default)'}\n"
-            "사용 예시: /thinking fast(low), /thinking medium, /thinking high, /thinking xhigh"
+            "사용 예시: /thinking low, /thinking medium, /thinking high, /thinking xhigh"
         )
     normalized = reasoning_mode(value)
     if normalized is None and value.strip().lower() not in {"default", "reset", "off", "none", "clear"}:
-        return "thinking 값은 fast(low), medium, high, xhigh 중 하나를 사용하세요."
+        return "thinking 값은 low, medium, high, xhigh 중 하나를 사용하세요."
     state["reasoning_effort"] = normalized
     save_state(state)
     if normalized is None:
         return "Codex thinking 오버라이드를 기본값으로 되돌렸습니다."
-    if str(value).strip().lower() == "fast":
-        return (
-            "Codex thinking 오버라이드를 저장했습니다: low\n"
-            "- Fast는 `model_reasoning_effort=low` 별칭입니다."
-        )
     return f"Codex thinking 오버라이드를 저장했습니다: {normalized}"
 
 
@@ -881,8 +934,9 @@ def cmd_commands() -> str:
             "사용 가능한 브리지 명령:",
             "- plain text: 활성 Codex 세션으로 전달",
             "- /help: 텔레그램 버튼 메뉴와 사용법 표시",
-            "- /resume: 현재 디렉토리와 하위 폴더 기준 세션 메뉴 표시",
+            "- /resume: 현재 디렉토리와 동일한 cwd 기준 세션 메뉴 표시",
             "- /set-workdir <cwd>: /resume 목록 기준 디렉토리 변경",
+            "- /fast: Codex Fast mode 토글",
             "- /new-session <cwd>: 지정한 폴더로 새 Codex 세션 생성",
             "- /delete-session: 현재 active Codex 세션 삭제",
             "- /read: 최근 Codex 기록 읽기",
@@ -958,7 +1012,8 @@ def main() -> int:
             print(cmd_thinking(state, value))
             return 0
         if command == "fast":
-            print(cmd_thinking(state, "fast"))
+            value = " ".join(args[1:]).strip() if len(args) > 1 else None
+            print(cmd_fast(state, value))
             return 0
         if command == "balanced":
             print(cmd_thinking(state, "medium"))

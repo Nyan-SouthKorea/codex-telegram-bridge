@@ -10,24 +10,26 @@
 - `OpenClaw` 의존 없음
 - 로컬 LLM 의존 없음
 - 평문 메시지는 active `Codex` 세션으로 전달
+- Telegram 슬래시 명령은 `/help`만 허용
+- 봇 시작 시 `setMyCommands`로 `/help`만 등록
 - `/help`는 버튼 메뉴만 표시
 - 버튼 메뉴:
   - `세션`
   - `모델`
-  - `Low (Fast)`
+  - `Fast`
   - `Thinking`
   - `권한`
   - `최근 출력`
   - `현재 상태`
   - `취소`
-- `Low (Fast)`는 `model_reasoning_effort=low` 별칭이며, 속도 2배 보장 모드는 아님
-- `/resume`은 세션 메뉴를 엶
+- `Fast`는 실제 Codex `fast_mode` 토글이며, 터미널 `/fast`와 같은 `2X plan usage` 모드
+- `Thinking`은 `low/medium/high/xhigh`만 담당하고 `Fast`와 분리됨
 - 세션 메뉴에서:
   - `디렉토리 설정`
   - 최근 세션 선택
   - `새 세션 만들기`
   - `현재 세션 삭제`
-- `/resume` 목록은 현재 디렉토리와 하위 폴더 세션만 표시
+- 세션 목록은 현재 디렉토리와 동일한 `cwd` 세션만 표시
 - 세션 디렉토리 브라우저에서:
   - 폴더 버튼으로 안쪽으로 이동
   - `../` 버튼으로 상위 폴더 이동
@@ -42,10 +44,11 @@
   - `현재 폴더로 세션 시작`
   - `새 폴더 만들기`를 누른 뒤 다음 일반 메시지로 폴더 이름을 보내 새 폴더 생성 후 세션 시작
 - 현재 세션 삭제는 active 세션만 archive 처리
-- `/read`와 `최근 출력`은 현재 active 세션을 우선 기준으로 읽음
-- `/status`는 아래 값을 보여줌
+- `최근 출력`은 현재 active 세션을 우선 기준으로 읽음
+- `현재 상태`는 아래 값을 보여줌
   - active session id/name/cwd
   - session scope cwd
+  - fast mode
   - permission
   - model
   - reasoning
@@ -97,11 +100,14 @@
 
 2026-03-20 로컬 검증 기준:
 
-- `scripts/run_tests.sh` 22개 통과
+- `scripts/run_tests.sh` 25개 통과
 - 새 레포 경로의 `codex-bridge`로 `new-session -> prompt -> delete-session` 실검증 완료
 - 새 레포 경로의 `codex-bridge`로 `resume -> read -> restore` 실검증 완료
-- 새 레포 경로의 `codex-bridge`로 `thinking fast -> reasoning low 저장 -> status 확인` 실검증 완료
-- 새 레포 경로의 `codex-bridge`로 `set-workdir -> status scope -> sessions-json filter -> restore` 실검증 완료
+- 새 레포 경로의 `codex-bridge`로 `fast off -> status -> fast on -> status` 실검증 완료
+- 새 레포 경로의 `codex-bridge`로 `set-workdir /data2/iena -> sessions-json`, `set-workdir /data2/iena/260319_agent_test -> sessions-json` 실검증 완료
+- 실제 `Codex CLI` 도움말 기준 `resume --all`이 cwd filtering 해제 옵션임을 확인했고, 브리지는 기본값을 동일 cwd 필터로 맞춤
+- Telegram Bot API `getMyCommands` 기준 `/help`만 등록된 것 확인
+- `codex-telegram-bridge.service` 재시작 후 `active` 확인
 - 기존 사용자 서비스 `telegram-codex-relay.service`는 중지했고, 현재는 `codex-telegram-bridge.service`가 새 레포 경로를 사용 중
 
 ## 비용과 외부 의존성

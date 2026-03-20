@@ -15,6 +15,7 @@ class FakeApi:
     def __init__(self):
         self.sent = []
         self.answered = []
+        self.commands = None
 
     def send_message(self, chat_id, text, *, reply_to_message_id=None, inline_keyboard=None):
         self.sent.append(
@@ -32,6 +33,10 @@ class FakeApi:
     def delete_webhook(self):
         return None
 
+    def set_help_only_commands(self):
+        self.commands = [{"command": "help", "description": "버튼 메뉴 열기"}]
+        return None
+
     def get_updates(self, offset=None, timeout=30):
         return []
 
@@ -40,8 +45,10 @@ class SimulatedBot(DirectTelegramCodexBot):
     def __init__(self, tmpdir: Path):
         self.fake_state = {
             "workdir": str(tmpdir),
+            "session_scope_cwd": str(tmpdir),
             "model": "gpt-5.4",
             "reasoning_effort": "low",
+            "fast_mode": False,
             "permission": "full",
             "active_session_id": "sess-active",
             "active_session_name": "Primary Session",
@@ -104,11 +111,16 @@ class SimulatedBot(DirectTelegramCodexBot):
                 sessions = [
                     session
                     for session in sessions
-                    if str(Path(session["cwd"]).resolve()) == scope or str(Path(session["cwd"]).resolve()).startswith(prefix)
+                    if str(Path(session["cwd"]).resolve()) == scope
                 ]
             return json.dumps(sessions, ensure_ascii=False)
         if args[:1] == ["status"]:
-            return "Codex relay 상태:\n- activeSessionId: sess-active"
+            return (
+                "Codex relay 상태:\n"
+                "- activeSessionId: sess-active\n"
+                f"- sessionScopeCwd: {self.fake_state.get('session_scope_cwd')}\n"
+                f"- fastMode: {'on' if self.fake_state.get('fast_mode') else 'off'}"
+            )
         if args[:1] == ["read"]:
             return "최근 Codex 출력:\n[1]\nhello"
         if args[:2] == ["resume", "sess-2"]:
@@ -122,11 +134,11 @@ class SimulatedBot(DirectTelegramCodexBot):
             self.fake_state["workdir"] = args[1]
             return f"Codex 새 세션을 만들었습니다.\n- id: sess-new\n- cwd: {args[1]}\n- title: [tg] ~/new-project"
         if args[:1] == ["set-workdir"]:
-            self.fake_state["workdir"] = args[1]
+            self.fake_state["session_scope_cwd"] = args[1]
             return (
                 "현재 디렉토리를 저장했습니다.\n"
                 f"- cwd: {args[1]}\n"
-                "- /resume 목록은 이 폴더와 하위 폴더 기준으로 표시됩니다."
+                "- /resume 목록은 이 폴더와 동일한 cwd 세션만 표시됩니다."
             )
         if args[:1] == ["delete-session"]:
             self.fake_state["active_session_id"] = None
@@ -135,9 +147,16 @@ class SimulatedBot(DirectTelegramCodexBot):
         if args[:2] == ["model", "gpt-5.4-mini"]:
             self.fake_state["model"] = "gpt-5.4-mini"
             return "Codex 모델 오버라이드를 저장했습니다: gpt-5.4-mini"
-        if args[:2] == ["thinking", "fast"]:
+        if args[:1] == ["fast"]:
+            current = bool(self.fake_state.get("fast_mode"))
+            target = not current if len(args) == 1 or args[1] == "toggle" else args[1] in {"on", "true", "1", "fast"}
+            self.fake_state["fast_mode"] = target
+            if target:
+                return "Codex Fast mode를 켰습니다.\n- fast_mode=true\n- fastest inference at 2X plan usage"
+            return "Codex Fast mode를 껐습니다.\n- fast_mode=false\n- standard inference mode"
+        if args[:2] == ["thinking", "low"]:
             self.fake_state["reasoning_effort"] = "low"
-            return "Codex thinking 오버라이드를 저장했습니다: low\n- Fast는 `model_reasoning_effort=low` 별칭입니다."
+            return "Codex thinking 오버라이드를 저장했습니다: low"
         if args[:2] == ["thinking", "xhigh"]:
             self.fake_state["reasoning_effort"] = "xhigh"
             return "Codex thinking 오버라이드를 저장했습니다: xhigh"
@@ -187,26 +206,26 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertIn("Codex 텔레그램 사용법", sent["text"])
         self.assertEqual(sent["reply_to_message_id"], 10)
         self.assertEqual(sent["inline_keyboard"][0][0]["text"], "세션")
-        self.assertEqual(sent["inline_keyboard"][1][0]["text"], "Low (Fast)")
+        self.assertEqual(sent["inline_keyboard"][1][0]["text"], "Fast")
+        self.assertIn("현재 Fast mode: off", sent["text"])
 
     def test_resume_menu_includes_create_and_delete_buttons(self):
-        self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 11, "text": "/resume"})
-        sent = self.bot.api.sent[-1]
-        self.assertIn("Codex 세션", sent["text"])
-        self.assertIn("세션 기준 폴더:", sent["text"])
-        self.assertIn("created:", sent["text"])
-        self.assertIn(str(Path(self.bot.config.workdir) / "project-a"), sent["text"])
-        self.assertEqual(sent["inline_keyboard"][0][0]["text"], "디렉토리 설정")
-        self.assertEqual(sent["inline_keyboard"][0][1]["text"], "새 세션 만들기")
-        self.assertEqual(sent["inline_keyboard"][1][0]["text"], "현재 세션 삭제")
+        self.bot.fake_state["session_scope_cwd"] = str(Path(self.bot.config.workdir) / "project-a")
+        text, buttons = self.bot.build_resume_menu()
+        self.assertIn("Codex 세션", text)
+        self.assertIn("세션 기준 폴더:", text)
+        self.assertIn("created:", text)
+        self.assertIn(str(Path(self.bot.config.workdir) / "project-a"), text)
+        self.assertEqual(buttons[0][0]["text"], "디렉토리 설정")
+        self.assertEqual(buttons[0][1]["text"], "새 세션 만들기")
+        self.assertEqual(buttons[1][0]["text"], "현재 세션 삭제")
 
     def test_resume_menu_filters_sessions_by_current_directory(self):
-        self.bot.fake_state["workdir"] = str(Path(self.bot.config.workdir) / "project-a")
-        self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 12, "text": "/resume"})
-        sent = self.bot.api.sent[-1]
-        self.assertIn(str(Path(self.bot.config.workdir) / "project-a"), sent["text"])
-        self.assertIn(str(Path(self.bot.config.workdir) / "project-a" / "nested"), sent["text"])
-        self.assertNotIn(str(Path(self.bot.config.workdir) / "project-b"), sent["text"])
+        self.bot.fake_state["session_scope_cwd"] = str(Path(self.bot.config.workdir) / "project-a")
+        text, _ = self.bot.build_resume_menu()
+        self.assertIn(str(Path(self.bot.config.workdir) / "project-a"), text)
+        self.assertNotIn(str(Path(self.bot.config.workdir) / "project-a" / "nested"), text)
+        self.assertNotIn(str(Path(self.bot.config.workdir) / "project-b"), text)
         self.assertEqual(self.bot.bridge_calls[0]["args"], ["sessions-json", "12", str(Path(self.bot.config.workdir) / "project-a")])
 
     def test_model_callback_sets_model_and_opens_thinking_menu(self):
@@ -233,27 +252,25 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertEqual(self.bot.bridge_calls[0]["args"], ["resume", "sess-2"])
         self.assertIn("Second Session", self.bot.api.sent[-1]["text"])
 
-    def test_fast_command_redirects_to_thinking_menu(self):
+    def test_fast_command_redirects_to_help(self):
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 76, "text": "/fast"})
         sent = self.bot.api.sent[-1]
-        self.assertIn("thinking 변경은 Thinking 버튼 메뉴에서 선택합니다.", sent["text"])
-        self.assertIn("Codex thinking 선택", sent["text"])
-        self.assertIn("Fast는 `model_reasoning_effort=low`를 저장하는 별칭입니다.", sent["text"])
+        self.assertIn("슬래시 명령은 /help만 지원합니다.", sent["text"])
+        self.assertIn("`/fast` 대신 버튼을 사용하세요.", sent["text"])
+        self.assertIn("Codex 텔레그램 사용법", sent["text"])
 
-    def test_fast_callback_reports_saved_low_state(self):
+    def test_fast_callback_toggles_fast_mode(self):
         self.bot.handle_callback(
             {
                 "id": "cb-fast",
-                "data": "tgbtn:thinking:fast",
+                "data": "tgbtn:fast:toggle",
                 "message": {"chat": {"id": 111111111}},
             }
         )
-        sent = self.bot.api.sent[-1]
-        self.assertEqual(self.bot.bridge_calls[0]["args"], ["thinking", "fast"])
-        self.assertIn("Codex thinking 오버라이드를 저장했습니다: low", sent["text"])
-        self.assertIn("현재 저장값: low (Fast)", sent["text"])
-        self.assertIn("토큰 생성 속도 2배를 보장하지 않습니다.", sent["text"])
-        self.assertEqual(self.bot.api.answered[-1]["text"], "thinking 저장: low (Fast)")
+        self.assertEqual(self.bot.bridge_calls[0]["args"], ["fast", "toggle"])
+        self.assertIn("Codex Fast mode를 켰습니다.", self.bot.api.sent[0]["text"])
+        self.assertIn("현재 Fast mode: on", self.bot.api.sent[1]["text"])
+        self.assertEqual(self.bot.api.answered[-1]["text"], "Fast mode 변경 완료")
 
     def test_plain_text_starts_prompt_and_sends_processing_notice(self):
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 77, "text": "파일 하나 만들어줘"})
@@ -265,11 +282,18 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 78, "text": "또 작업"})
         self.assertEqual(self.bot.api.sent[-1]["text"], "이미 Codex 작업이 실행 중입니다.")
 
-    def test_status_command_appends_runtime_when_busy(self):
+    def test_status_button_appends_runtime_when_busy(self):
         self.bot.runtime_busy = True
-        self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 79, "text": "/status"})
+        self.bot.handle_callback(
+            {
+                "id": "cb-status",
+                "data": "tgbtn:status",
+                "message": {"chat": {"id": 111111111}},
+            }
+        )
         self.assertIn("Runtime:", self.bot.api.sent[-1]["text"])
         self.assertIn("activeSessionId: sess-active", self.bot.api.sent[-1]["text"])
+        self.assertIn("fastMode: off", self.bot.api.sent[-1]["text"])
 
     def test_permission_callback_updates_mode(self):
         self.bot.handle_callback(
@@ -316,7 +340,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertIn("세션 디렉토리 선택", text)
         self.assertIn("현재 /resume 기준 폴더", text)
         self.assertIn("Primary Session", text)
-        self.assertIn("Nested Session", text)
+        self.assertNotIn("Nested Session", text)
         labels = [button["text"] for row in buttons for button in row]
         self.assertIn("이 폴더를 현재 디렉토리로 설정", labels)
 
@@ -334,6 +358,22 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertEqual(self.bot.bridge_calls[0]["args"], ["set-workdir", str(target)])
         self.assertIn("현재 디렉토리를 저장했습니다.", self.bot.api.sent[0]["text"])
         self.assertIn("세션 기준 폴더:", self.bot.api.sent[1]["text"])
+        self.assertIn(str(target), self.bot.api.sent[1]["text"])
+
+    def test_resume_scope_persists_after_resuming_other_session(self):
+        scope = Path(self.bot.config.workdir) / "project-a"
+        self.bot.fake_state["session_scope_cwd"] = str(scope)
+        self.bot.handle_callback(
+            {
+                "id": "cb-2",
+                "data": "tgbtn:resume:sess-2",
+                "message": {"chat": {"id": 111111111}},
+            }
+        )
+        self.bot.bridge_calls.clear()
+        text, _ = self.bot.build_resume_menu()
+        self.assertEqual(self.bot.bridge_calls[0]["args"], ["sessions-json", "12", str(scope)])
+        self.assertIn(str(scope), text)
 
     def test_new_folder_message_creates_directory_and_session(self):
         parent = self.tmpdir / "parent"
@@ -344,13 +384,26 @@ class TelegramRelaySimulationTests(unittest.TestCase):
         self.assertEqual(self.bot.bridge_calls[0]["args"], ["new-session", str(parent / "fresh-folder")])
         self.assertIsNone(self.bot.pending_new_folder_parent())
 
-    def test_cancel_clears_pending_new_folder_input(self):
+    def test_cancel_command_redirects_to_help(self):
         parent = self.tmpdir / "parent"
         parent.mkdir()
         self.bot.set_pending_new_folder_parent(parent)
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 83, "text": "/cancel"})
-        self.assertIsNone(self.bot.pending_new_folder_parent())
-        self.assertIn("새 폴더 생성 입력을 취소했습니다.", self.bot.api.sent[0]["text"])
+        self.assertEqual(self.bot.pending_new_folder_parent(), parent)
+        self.assertIn("슬래시 명령은 /help만 지원합니다.", self.bot.api.sent[-1]["text"])
+
+    def test_run_forever_registers_help_only_command(self):
+        updates = [{"update_id": 1, "message": {"chat": {"id": 111111111}, "message_id": 1, "text": "/help"}}]
+
+        def fake_get_updates(offset=None, timeout=30):
+            if updates:
+                return [updates.pop(0)]
+            raise KeyboardInterrupt
+
+        self.bot.api.get_updates = fake_get_updates
+        with self.assertRaises(KeyboardInterrupt):
+            self.bot.run_forever()
+        self.assertEqual(self.bot.api.commands, [{"command": "help", "description": "버튼 메뉴 열기"}])
 
     def test_session_delete_deletes_current_active_session(self):
         self.bot.handle_callback(
@@ -365,7 +418,7 @@ class TelegramRelaySimulationTests(unittest.TestCase):
 
     def test_unknown_command_redirects_to_help(self):
         self.bot.handle_message({"chat": {"id": 111111111}, "message_id": 80, "text": "/unknown"})
-        self.assertIn("지원하지 않는 명령입니다", self.bot.api.sent[-1]["text"])
+        self.assertIn("슬래시 명령은 /help만 지원합니다.", self.bot.api.sent[-1]["text"])
         self.assertIn("Codex 텔레그램 사용법", self.bot.api.sent[-1]["text"])
 
     def test_wait_prompt_uses_communicate_input(self):
@@ -440,14 +493,19 @@ class CodexBridgeUnitTests(unittest.TestCase):
         self.assertIn("Active Session", output)
         self.assertIn("active output", output)
 
-    def test_cmd_thinking_fast_is_explicit_low_alias(self):
-        state = {"reasoning_effort": "xhigh"}
+    def test_cmd_fast_toggles_real_fast_mode(self):
+        state = {"fast_mode": False}
 
-        output = bridge.cmd_thinking(state, "fast")
+        output = bridge.cmd_fast(state, None)
 
-        self.assertEqual(state["reasoning_effort"], "low")
-        self.assertIn("저장했습니다: low", output)
-        self.assertIn("Fast는 `model_reasoning_effort=low` 별칭", output)
+        self.assertEqual(state["fast_mode"], True)
+        self.assertIn("fast_mode=true", output)
+        self.assertIn("2X plan usage", output)
+
+    def test_current_scope_cwd_uses_separate_scope_field(self):
+        state = {"workdir": "/tmp/active", "session_scope_cwd": "/tmp/scope"}
+
+        self.assertEqual(bridge.current_scope_cwd(state), "/tmp/scope")
 
 
 if __name__ == "__main__":

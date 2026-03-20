@@ -142,7 +142,7 @@ def format_state_value(value: str | None, default_label: str = "(default)") -> s
 def format_reasoning_value(value: str | None) -> str:
     normalized = str(value or "").strip().lower()
     labels = {
-        "low": "low (Fast)",
+        "low": "low",
         "medium": "medium",
         "high": "high",
         "xhigh": "xhigh",
@@ -150,6 +150,10 @@ def format_reasoning_value(value: str | None) -> str:
     if not normalized:
         return "(default)"
     return labels.get(normalized, normalized)
+
+
+def format_fast_mode_value(value: Any) -> str:
+    return "on" if bool(value) else "off"
 
 
 def truncate_button_label(value: str, max_chars: int = 28) -> str:
@@ -222,6 +226,19 @@ class TelegramApi:
 
     def delete_webhook(self) -> None:
         self.request("deleteWebhook", {"drop_pending_updates": False})
+
+    def set_help_only_commands(self) -> None:
+        self.request(
+            "setMyCommands",
+            {
+                "commands": [
+                    {
+                        "command": "help",
+                        "description": "버튼 메뉴 열기",
+                    }
+                ]
+            },
+        )
 
     def get_updates(self, offset: int | None, timeout: int) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
@@ -303,7 +320,7 @@ class DirectTelegramCodexBot:
     def current_scope_path(self) -> Path:
         state = self.load_bridge_state()
         fallback = self.safe_directory(self.config.workdir, Path.home())
-        return self.safe_directory(state.get("workdir"), fallback)
+        return self.safe_directory(state.get("session_scope_cwd") or state.get("workdir"), fallback)
 
     def browser_state(self, path_key: str, page_key: str, token_key: str, fallback: Path) -> tuple[Path, int, str]:
         data = self.load_runtime_state()
@@ -435,24 +452,27 @@ class DirectTelegramCodexBot:
             [
                 "Codex 텔레그램 사용법",
                 "- 평문은 현재 Codex 세션으로 바로 전달됩니다.",
-                "- 설정 변경은 버튼으로만 합니다.",
+                "- 슬래시 명령은 /help만 지원합니다.",
+                "- 설정과 조회는 버튼으로만 합니다.",
                 "- 권한이 full이면 지속 세션, read/deny면 격리 1회 실행입니다.",
                 "- 세션 메뉴의 `디렉토리 설정`으로 /resume 기준 폴더를 바꿀 수 있습니다.",
-                "- `Fast`는 속도 배수 모드가 아니라 `reasoning=low` 별칭입니다.",
+                "- `Fast`는 실제 Codex Fast mode 토글입니다.",
                 "",
                 f"현재 모델: {format_state_value(state.get('model'))}",
+                f"현재 Fast mode: {format_fast_mode_value(state.get('fast_mode'))}",
                 f"현재 thinking: {format_reasoning_value(state.get('reasoning_effort'))}",
                 f"현재 권한: {format_state_value(state.get('permission'), 'full')}",
                 f"현재 세션: {format_state_value(state.get('active_session_name'), '(none)')}",
             ]
         )
+        fast_enabled = bool(state.get("fast_mode"))
         buttons = [
             [
                 {"text": "세션", "callback_data": button_data("menu", "resume")},
                 {"text": "모델", "callback_data": button_data("menu", "model")},
             ],
             [
-                {"text": "Low (Fast)", "callback_data": button_data("thinking", "fast")},
+                {"text": label_with_check(fast_enabled, "Fast"), "callback_data": button_data("fast", "toggle")},
                 {"text": "Thinking", "callback_data": button_data("menu", "thinking")},
             ],
             [
@@ -478,7 +498,7 @@ class DirectTelegramCodexBot:
             f"현재 세션: {format_state_value(state.get('active_session_name'), '(none)')}",
             f"세션 기준 폴더: {scope_path}",
             "",
-            "표시 규칙: 이 폴더와 하위 폴더 세션만 보여줍니다.",
+            "표시 규칙: 이 폴더와 동일한 cwd 세션만 보여줍니다.",
             "최근 세션 순서: 최신 활동 순",
             "",
         ]
@@ -494,7 +514,7 @@ class DirectTelegramCodexBot:
             ]
         )
         if not entries:
-            text_lines.append("- 이 폴더와 하위 폴더에 세션이 없습니다.")
+            text_lines.append("- 이 폴더와 동일한 cwd 세션이 없습니다.")
         for index, entry in enumerate(entries, start=1):
             active = bool(entry.get("active")) or str(entry.get("id") or "") == active_id
             text_lines.extend(self.format_session_entry_lines(index, entry, active))
@@ -533,7 +553,7 @@ class DirectTelegramCodexBot:
             f"현재 /resume 기준 폴더: {scope_path}",
             f"페이지: {page + 1}/{page_count}",
             "",
-            "이 폴더를 현재 디렉토리로 설정하면 /resume 목록이 이 폴더와 하위 폴더 기준으로 바뀝니다.",
+            "이 폴더를 현재 디렉토리로 설정하면 /resume 목록이 이 폴더와 동일한 cwd 기준으로 바뀝니다.",
         ]
         rows: list[list[dict[str, str]]] = []
         if visible:
@@ -557,7 +577,7 @@ class DirectTelegramCodexBot:
                 text_lines.extend(self.format_session_entry_lines(index, entry, active))
                 text_lines.append("")
         else:
-            text_lines.append("- 이 폴더와 하위 폴더에 세션이 없습니다.")
+            text_lines.append("- 이 폴더와 동일한 cwd 세션이 없습니다.")
         nav_row: list[dict[str, str]] = []
         if path.parent != path:
             nav_row.append({"text": "../", "callback_data": button_data("resbrowse", f"up|{token}")})
@@ -604,7 +624,7 @@ class DirectTelegramCodexBot:
                 [
                     "",
                     f"새 폴더 이름 입력 대기 중: {pending_parent}",
-                    "이름을 일반 메시지로 보내거나 /cancel 을 누르세요.",
+                    "이름을 일반 메시지로 보내거나 취소 버튼을 누르세요.",
                 ]
             )
         rows: list[list[dict[str, str]]] = []
@@ -695,13 +715,12 @@ class DirectTelegramCodexBot:
                 "Codex thinking 선택",
                 f"현재 thinking: {format_reasoning_value(state.get('reasoning_effort'))}",
                 "",
-                "Fast는 `model_reasoning_effort=low`를 저장하는 별칭입니다.",
-                "속도 2배를 보장하는 모드는 아닙니다.",
+                "Fast mode는 메인 메뉴의 Fast 버튼에서 따로 토글합니다.",
             ]
         )
         buttons = [
             [
-                {"text": label_with_check(current == "low", "Low (Fast)"), "callback_data": button_data("thinking", "fast")},
+                {"text": label_with_check(current == "low", "Low"), "callback_data": button_data("thinking", "low")},
                 {"text": label_with_check(current == "medium", "Medium"), "callback_data": button_data("thinking", "medium")},
             ],
             [
@@ -762,7 +781,7 @@ class DirectTelegramCodexBot:
             "이미 Codex 작업이 실행 중입니다.\n"
             f"- started: {seconds}s ago\n"
             f"- preview: {running.prompt_preview}\n"
-            "- 필요하면 /cancel 후 다시 시도하세요."
+            "- 필요하면 취소 버튼을 누른 뒤 다시 시도하세요."
         )
 
     def create_new_folder_session(self, folder_name: str) -> str:
@@ -957,7 +976,7 @@ class DirectTelegramCodexBot:
                 except Exception as exc:
                     self.api.send_message(
                         chat_id,
-                        f"새 폴더 세션 생성에 실패했습니다.\n{exc}\n\n다시 이름을 보내거나 /cancel 을 누르세요.",
+                        f"새 폴더 세션 생성에 실패했습니다.\n{exc}\n\n다시 이름을 보내거나 취소 버튼을 누르세요.",
                         reply_to_message_id=message_id,
                     )
                     return
@@ -972,49 +991,11 @@ class DirectTelegramCodexBot:
             return
 
         name, args = command
-        if name == "help":
+        if name in {"help", "start"}:
             self.send_menu(chat_id, "help", reply_to_message_id=message_id)
             return
-        if name == "resume":
-            notice = "세션 전환은 이제 버튼으로만 선택합니다." if args else None
-            self.send_menu(chat_id, "resume", reply_to_message_id=message_id, notice=notice)
-            return
-        if name in {"cwd", "workdir"}:
-            self.send_menu(chat_id, "resume-browser", reply_to_message_id=message_id, notice="현재 디렉토리 변경은 버튼으로만 선택합니다.")
-            return
-        if name == "model":
-            notice = "모델 변경은 이제 버튼으로만 선택합니다." if args else None
-            self.send_menu(chat_id, "model", reply_to_message_id=message_id, notice=notice)
-            return
-        if name == "thinking":
-            notice = "thinking 변경은 이제 버튼으로만 선택합니다." if args else None
-            self.send_menu(chat_id, "thinking", reply_to_message_id=message_id, notice=notice)
-            return
-        if name in {"fast", "balanced", "deep"}:
-            self.send_menu(chat_id, "thinking", reply_to_message_id=message_id, notice="thinking 변경은 Thinking 버튼 메뉴에서 선택합니다.")
-            return
-        if name == "permission":
-            notice = "권한 변경은 이제 버튼으로만 선택합니다." if args else None
-            self.send_menu(chat_id, "permission", reply_to_message_id=message_id, notice=notice)
-            return
-        if name == "status":
-            output = self.run_bridge(["status"])
-            self.api.send_message(chat_id, self.append_runtime_status(output), reply_to_message_id=message_id)
-            return
-        if name == "read":
-            output = self.run_bridge(["read"])
-            self.api.send_message(chat_id, output, reply_to_message_id=message_id)
-            return
-        if name == "cancel":
-            if pending_parent is not None:
-                self.set_pending_new_folder_parent(None)
-                self.api.send_message(chat_id, "새 폴더 생성 입력을 취소했습니다.", reply_to_message_id=message_id)
-                self.send_menu(chat_id, "session-browser")
-                return
-            output = self.cancel_running_prompt()
-            self.api.send_message(chat_id, output, reply_to_message_id=message_id)
-            return
-        self.send_menu(chat_id, "help", reply_to_message_id=message_id, notice=f"지원하지 않는 명령입니다: /{name}")
+        notice = f"슬래시 명령은 /help만 지원합니다. `/{name}` 대신 버튼을 사용하세요."
+        self.send_menu(chat_id, "help", reply_to_message_id=message_id, notice=notice)
 
     def handle_callback(self, callback_query: dict[str, Any]) -> None:
         callback_id = str(callback_query.get("id") or "")
@@ -1131,7 +1112,7 @@ class DirectTelegramCodexBot:
                         chat_id,
                         "새 폴더 이름을 다음 메시지로 보내세요.\n"
                         f"- parent: {current_path}\n"
-                        "- 취소하려면 /cancel",
+                        "- 취소하려면 취소 버튼",
                     )
                     self.api.answer_callback_query(callback_id, "폴더 이름 입력 대기")
                     return
@@ -1201,19 +1182,17 @@ class DirectTelegramCodexBot:
                 self.send_menu(chat_id, "thinking")
                 self.api.answer_callback_query(callback_id, "모델 변경 완료")
                 return
+            if kind == "fast":
+                output = self.run_bridge(["fast", value or "toggle"])
+                self.api.send_message(chat_id, output)
+                self.send_menu(chat_id, "help")
+                self.api.answer_callback_query(callback_id, "Fast mode 변경 완료")
+                return
             if kind == "thinking" and value:
                 output = self.run_bridge(["thinking", value])
                 state = self.load_bridge_state()
                 actual = format_reasoning_value(state.get("reasoning_effort"))
-                if value == "fast":
-                    output = (
-                        f"{output}\n"
-                        f"- 현재 저장값: {actual}\n"
-                        "- Fast 버튼은 `model_reasoning_effort=low`를 저장합니다.\n"
-                        "- 토큰 생성 속도 2배를 보장하지 않습니다."
-                    )
-                else:
-                    output = f"{output}\n- 현재 저장값: {actual}"
+                output = f"{output}\n- 현재 저장값: {actual}"
                 self.api.send_message(chat_id, output)
                 self.api.answer_callback_query(callback_id, f"thinking 저장: {actual}")
                 return
@@ -1235,6 +1214,7 @@ class DirectTelegramCodexBot:
 
     def run_forever(self) -> None:
         self.api.delete_webhook()
+        self.api.set_help_only_commands()
         offset: int | None = None
         while True:
             try:
